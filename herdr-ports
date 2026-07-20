@@ -311,7 +311,7 @@ popup() {
 		# (\033[H, no full clear), every line erased to EOL (\033[K), leftovers
 		# erased with \033[J, all emitted in a single write. No subshells in
 		# this section - they are what made frames slow.
-		# Screen layout: title=1, blank=2, header/none=3, rows=4..n+3,
+		# Screen layout: title=1, header/none=2, rows=3..n+2,
 		# footer bar pinned on the pane's last line.
 		local frame='' line mark chk suffix fl fr pad rs r1s r1e r2s r2e r3s r3e size
 		size=$(stty size 2> /dev/null) || size=''
@@ -329,7 +329,7 @@ popup() {
 		frame=$'\033[H'
 		suffix=''
 		[ "$show_all" = 1 ] && suffix=' (all listeners)'
-		frame+=$'\033[1m'"Active dev servers$suffix"$'\033[0m\033[K\n\033[K\n'
+		frame+=$'\033[1m'"Active dev servers$suffix"$'\033[0m\033[K\n'
 		if [ "$n" = 0 ]; then
 			frame+='  (none - "a" includes listeners outside herdr workspaces)'$'\033[K\n'
 		else
@@ -426,8 +426,8 @@ popup() {
 							IFS=';' read -r mb mx my <<< "$ev"
 							case "$mb" in
 								0) # left click: row = toggle checkbox, footer = action
-									if [ "$my" -ge 4 ] && [ "$my" -le "$((n + 3))" ]; then
-										cur=$((my - 3))
+									if [ "$my" -ge 3 ] && [ "$my" -le "$((n + 2))" ]; then
+										cur=$((my - 2))
 										checked[cur]=$((1 - checked[cur]))
 									elif [ "$my" = "$rows" ]; then
 										for k in 1 2 3 4; do
