@@ -22,7 +22,8 @@
 # Ports are attributed to a Space by matching the listener's process cwd
 # against the cwds of the workspace's panes, so servers started outside herdr
 # still show up as long as they run inside a workspace directory.
-# Requires jq; uses lsof (macOS/Linux) or falls back to ss (Linux).
+# Requires jq; lists sockets with netstat (macOS sysctl dump), ss (Linux
+# netlink) or lsof as universal fallback - lsof also resolves cwds on macOS.
 # Written for bash 3.2 (stock macOS): no mapfile, no associative arrays; and
 # since read -t only takes whole seconds there, escape-sequence tails are read
 # via termios VMIN=0/VTIME=1 (stty + dd) so a bare Escape quits in ~0.1s.
@@ -39,14 +40,25 @@ INTERVAL="${HERDR_PORTS_INTERVAL:-5}"
 # herdr's theme, so the exact accent cannot be queried - override to match.
 ACCENT="${HERDR_PORTS_ACCENT:-223}"
 
-# One line per (pid, port) TCP listener: "pid<TAB>port"
+# One line per (pid, port) TCP listener: "pid<TAB>port".
+# Fastest one-shot kernel dump per platform (~5ms vs ~70ms for lsof, which
+# walks every fd of every process): macOS netstat reads the whole TCP pcblist
+# in a single sysctl and carries a process:pid column; Linux ss asks netlink
+# inet_diag. lsof remains the universal fallback.
 pid_ports() {
-	if command -v lsof > /dev/null 2>&1; then
-		lsof -nP -iTCP -sTCP:LISTEN -Fpn 2> /dev/null | awk '
-			/^p/ { pid = substr($0, 2) }
-			/^n/ { port = $0; sub(/.*:/, "", port); if (port ~ /^[0-9]+$/) print pid "\t" port }
+	if [ "$(uname 2> /dev/null)" = Darwin ] && command -v netstat > /dev/null 2>&1; then
+		# The process:pid token is located from the right: macOS addresses put
+		# a "." before the port, so a field ending in ":digits" can only be
+		# process:pid - immune to process names containing spaces or dots
+		netstat -anv -p tcp 2> /dev/null | awk '
+			$6 == "LISTEN" {
+				port = $4; sub(/.*\./, "", port)
+				pid = ""
+				for (i = NF; i > 0; i--) if ($i ~ /:[0-9]+$/) { pid = $i; sub(/.*:/, "", pid); break }
+				if (port ~ /^[0-9]+$/ && pid ~ /^[0-9]+$/) print pid "\t" port
+			}
 		' | sort -u
-	else
+	elif [ -d /proc ] && command -v ss > /dev/null 2>&1; then
 		ss -ltnpH 2> /dev/null | awk '
 			{
 				port = $4; sub(/.*:/, "", port)
@@ -55,6 +67,11 @@ pid_ports() {
 					$0 = substr($0, RSTART + RLENGTH)
 				}
 			}
+		' | sort -u
+	elif command -v lsof > /dev/null 2>&1; then
+		lsof -nP -iTCP -sTCP:LISTEN -Fpn 2> /dev/null | awk '
+			/^p/ { pid = substr($0, 2) }
+			/^n/ { port = $0; sub(/.*:/, "", port); if (port ~ /^[0-9]+$/) print pid "\t" port }
 		' | sort -u
 	fi
 }

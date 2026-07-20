@@ -16,8 +16,9 @@ up as long as they run inside a workspace directory. System daemons (cwd `/`,
 herdr plugin install Numbered-com/herdr-ports
 ```
 
-Requirements: `jq`, and `lsof` (macOS/Linux) or `ss` (Linux). Bash 3.2+ (stock
-macOS works).
+Requirements: `jq`, plus the fastest available socket lister - `netstat`
+(macOS, built-in), `ss` (Linux, iproute2) or `lsof` (universal fallback; also
+used on macOS to resolve process cwds). Bash 3.2+ (stock macOS works).
 
 ## Configure
 
