@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# herdr-ports - surface active dev servers in herdr.
+#
+#   herdr-ports               interactive popup: checkbox list of servers, kill them
+#   herdr-ports list          print the table once and exit (scripting/debug)
+#   herdr-ports watch         poller: tag Spaces running >=1 TCP listener with a
+#                             generic $ports badge (workspace metadata, TTL-cleared)
+#   herdr-ports ensure-watch  start the watcher if it is not already running
+#                             (invoked by the pane.created plugin event)
+#
+# Ships as a herdr plugin: the popup pane and the watcher autostart are wired
+# by herdr-plugin.toml. Two lines stay in the user's config.toml because
+# plugins cannot inject them (see README):
+#   [ui.sidebar.spaces]
+#   rows = [["state_icon", "workspace"], ["branch", "git_status", "$ports"]]
+#
+#   [[keys.command]]
+#   key = "prefix+a"
+#   type = "plugin_action"
+#   command = "numbered.ports.open"
+#
+# Ports are attributed to a Space by matching the listener's process cwd
+# against the cwds of the workspace's panes, so servers started outside herdr
+# still show up as long as they run inside a workspace directory.
+# Requires jq; uses lsof (macOS/Linux) or falls back to ss (Linux).
+# Written for bash 3.2 (stock macOS): no mapfile, no associative arrays,
+# integer-only read timeouts.
+set -u
+
+HERDR="${HERDR_BIN_PATH:-herdr}"
+BADGE="${HERDR_PORTS_BADGE:-[ports]}"
+INTERVAL="${HERDR_PORTS_INTERVAL:-5}"
+
+# One line per (pid, port) TCP listener: "pid<TAB>port"
+pid_ports() {
+	if command -v lsof > /dev/null 2>&1; then
+		lsof -nP -iTCP -sTCP:LISTEN -Fpn 2> /dev/null | awk '
+			/^p/ { pid = substr($0, 2) }
+			/^n/ { port = $0; sub(/.*:/, "", port); if (port ~ /^[0-9]+$/) print pid "\t" port }
+		' | sort -u
+	else
+		ss -ltnpH 2> /dev/null | awk '
+			{
+				port = $4; sub(/.*:/, "", port)
+				while (match($0, /pid=[0-9]+/)) {
+					print substr($0, RSTART + 4, RLENGTH - 4) "\t" port
+					$0 = substr($0, RSTART + RLENGTH)
+				}
+			}
+		' | sort -u
+	fi
+}
+
+# stdin: "pid<TAB>..." lines -> "pid<TAB>cwd". Roots ("/") are dropped: system
+# daemons live there and would otherwise match every workspace.
+pid_cwds() {
+	local pids pid cwd
+	pids=$(cut -f1 | sort -un)
+	[ -n "$pids" ] || return 0
+	if [ -d /proc ]; then
+		for pid in $pids; do
+			cwd=$(readlink "/proc/$pid/cwd" 2> /dev/null) || continue
+			[ "$cwd" = "/" ] && continue
+			printf '%s\t%s\n' "$pid" "$cwd"
+		done
+	else
+		lsof -a -d cwd -p "$(printf '%s\n' $pids | paste -s -d, -)" -Fpn 2> /dev/null | awk '
+			/^p/ { pid = substr($0, 2) }
+			/^n/ { cwd = substr($0, 2); if (cwd != "/") print pid "\t" cwd }
+		'
+	fi
+}
+
+# "workspace_id<TAB>cwd" for every pane (empty when the herdr server is down)
+workspace_cwds() {
+	"$HERDR" api snapshot 2> /dev/null | jq -r '
+		.. | objects | select(has("pane_id") and has("workspace_id"))
+		| .workspace_id as $w
+		| ([.cwd?, .foreground_cwd?] | unique | .[])
+		| select(type == "string" and . != "" and . != "/")
+		| "\($w)\t\(.)"
+	' 2> /dev/null | sort -u
+}
+
+# "workspace_id<TAB>label"
+workspace_labels() {
+	"$HERDR" workspace list 2> /dev/null | jq -r '
+		.result.workspaces[]? | [.workspace_id, (.label // .workspace_id)] | @tsv
+	' 2> /dev/null
+}
+
+# $1: workspace_cwds file; stdin: "pid<TAB>cwd" -> "pid<TAB>cwd<TAB>ws_id".
+# A listener belongs to a Space when its cwd sits under a pane cwd or vice
+# versa (server launched at the repo root while panes sit in subdirs). $HOME
+# is excluded from the reverse match: launchd/user daemons living there would
+# claim every workspace under it.
+match_join() {
+	awk -F'\t' -v home="$HOME" '
+		NR == FNR { wsid[NR] = $1; wcwd[NR] = $2; n = NR; next }
+		{
+			for (i = 1; i <= n; i++) {
+				w = wcwd[i]
+				if ($2 == w || index($2, w "/") == 1 || ($2 != home && index(w, $2 "/") == 1)) {
+					print $1 "\t" $2 "\t" wsid[i]
+				}
+			}
+		}
+	' "$1" - | sort -u
+}
+
+pidfile_path() {
+	echo "/tmp/herdr-ports-watcher.$(id -u).pid"
+}
+
+watcher_alive() {
+	local pidfile
+	pidfile=$(pidfile_path)
+	[ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2> /dev/null)" 2> /dev/null
+}
+
+watch_loop() {
+	watcher_alive && exit 0
+	echo $$ > "$(pidfile_path)"
+	trap 'rm -f "$(pidfile_path)"' EXIT
+
+	# TTL outlives one missed poll so the badge does not flicker, but clears
+	# itself shortly after the last server dies - no explicit cleanup needed.
+	# seq is epoch-based: the server keeps the last seq per source across
+	# watcher restarts and silently drops posts that do not exceed it, so a
+	# counter restarting at 1 would never show again.
+	local ttl=$(((INTERVAL + 10) * 1000)) ws
+	while :; do
+		for ws in $(pid_ports | pid_cwds | match_join <(workspace_cwds) | cut -f3 | sort -u); do
+			"$HERDR" workspace report-metadata "$ws" --source ports \
+				--token ports="$BADGE" --ttl-ms "$ttl" --seq "$(date +%s)" > /dev/null 2>&1
+		done
+		sleep "$INTERVAL"
+	done
+}
+
+# pane.created hook: spawn the watcher singleton and return immediately so the
+# event never blocks herdr. $0 is resolved to an absolute path because the
+# detached child must not depend on the hook's cwd surviving.
+ensure_watch() {
+	watcher_alive && exit 0
+	local self
+	self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+	nohup "$self" watch > /dev/null 2>&1 &
+}
+
+# "space<TAB>pid<TAB>:p1 :p2<TAB>cwd<TAB>cmd" sorted by space then first port;
+# space is "-" for listeners outside any herdr workspace (sorted last)
+build_rows() {
+	local tmp="$1" space pid ports cwd cmd
+	pid_ports > "$tmp/ports"
+	pid_cwds < "$tmp/ports" > "$tmp/cwds"
+	workspace_cwds > "$tmp/ws"
+	workspace_labels > "$tmp/labels"
+	match_join "$tmp/ws" < "$tmp/cwds" | cut -f1,3 | sort -u > "$tmp/pidws"
+	awk -F'\t' '
+		FILENAME == ARGV[1] { lbl[$1] = $2; next }
+		FILENAME == ARGV[2] { if (!($1 in ws)) ws[$1] = ($2 in lbl ? lbl[$2] : $2); next }
+		FILENAME == ARGV[3] { ports[$1] = ports[$1] (ports[$1] == "" ? "" : " ") ":" $2; if (!($1 in first)) first[$1] = $2; next }
+		{ cwd[$1] = $2 }
+		END {
+			for (p in ports) {
+				space = (p in ws ? ws[p] : "-")
+				# "~" sort sentinel pushes unmatched listeners after real spaces
+				printf "%s\t%05d\t%s\t%s\t%s\t%s\n", (space == "-" ? "~" : space), first[p], space, p, ports[p], (p in cwd ? cwd[p] : "-")
+			}
+		}
+	' "$tmp/labels" "$tmp/pidws" "$tmp/ports" "$tmp/cwds" | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2 | cut -f3- \
+		| while IFS=$'\t' read -r space pid ports cwd; do
+			cmd=$(ps -o args= -p "$pid" 2> /dev/null | head -1 | cut -c1-48)
+			printf '%s\t%s\t%s\t%s\t%s\n' "$space" "$pid" "$ports" "$cwd" "${cmd:-?}"
+		done
+}
+
+shorten() {
+	local p="${1/#$HOME/\~}"
+	[ ${#p} -gt 30 ] && p="...${p: -27}"
+	printf '%s' "$p"
+}
+
+list_mode() {
+	# not local: the EXIT trap fires after this returned, under set -u
+	tmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports.XXXXXX")
+	trap 'rm -rf "$tmp"' EXIT
+	local space pid ports cwd cmd
+	build_rows "$tmp" > "$tmp/rows"
+	printf '%-12s %-20s %-7s %-30s %s\n' 'SPACE' 'PORTS' 'PID' 'PATH' 'COMMAND'
+	while IFS=$'\t' read -r space pid ports cwd cmd; do
+		printf '%-12.12s %-20s %-7s %-30s %s\n' "$space" "$ports" "$pid" "$(shorten "$cwd")" "$cmd"
+	done < "$tmp/rows"
+}
+
+popup() {
+	local show_all=0 n='' cur=1 needs_refresh=1 i key seq esc_timeout prev targets
+	local space pid ports cwd cmd
+	# bash 3.2 (stock macOS) only accepts integer read timeouts: bare-Escape
+	# detection costs up to 1s there, arrows are unaffected either way
+	esc_timeout=1
+	[ "${BASH_VERSINFO[0]}" -ge 4 ] && esc_timeout=0.05
+	# not local: the EXIT trap fires after popup() returned, under set -u
+	tmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports.XXXXXX")
+	trap 'rm -rf "$tmp"; printf "\033[?25h"' EXIT
+	printf '\033[?25l'
+
+	while :; do
+		if [ "$needs_refresh" = 1 ]; then
+			build_rows "$tmp" > "$tmp/rows"
+			if [ "$show_all" = 1 ]; then
+				cp "$tmp/rows" "$tmp/view"
+			else
+				awk -F'\t' '$1 != "-"' "$tmp/rows" > "$tmp/view"
+			fi
+			# carry checkmarks across refreshes by pid
+			prev=' '
+			for ((i = 1; i <= ${n:-0}; i++)); do
+				[ "${checked[i]:-0}" = 1 ] && prev="$prev${pids[i]} "
+			done
+			n=0
+			while IFS=$'\t' read -r space pid ports cwd cmd; do
+				n=$((n + 1))
+				spaces[n]=$space
+				pids[n]=$pid
+				portss[n]=$ports
+				paths[n]=$cwd
+				cmds[n]=$cmd
+				checked[n]=0
+				case "$prev" in *" $pid "*) checked[n]=1 ;; esac
+			done < "$tmp/view"
+			[ "$cur" -gt "$n" ] && cur=$n
+			[ "$cur" -lt 1 ] && cur=1
+			needs_refresh=0
+		fi
+
+		printf '\033[2J\033[H'
+		printf 'Active dev servers%s\n\n' "$([ "$show_all" = 1 ] && echo ' (all listeners)')"
+		if [ "$n" = 0 ]; then
+			echo '  (none - "a" includes listeners outside herdr workspaces)'
+		else
+			printf '      %-12s %-20s %-7s %-30s %s\n' 'SPACE' 'PORTS' 'PID' 'PATH' 'COMMAND'
+			for ((i = 1; i <= n; i++)); do
+				printf '%s [%s] %-12.12s %-20s %-7s %-30s %s\n' \
+					"$([ "$i" = "$cur" ] && printf '>' || printf ' ')" \
+					"$([ "${checked[i]}" = 1 ] && printf 'x' || printf ' ')" \
+					"${spaces[i]}" "${portss[i]}" "${pids[i]}" "$(shorten "${paths[i]}")" "${cmds[i]}"
+			done
+		fi
+		printf '\n  up/down move   space check   enter kill   a %s   r refresh   esc quit\n' \
+			"$([ "$show_all" = 1 ] && echo 'workspace only' || echo 'all listeners')"
+
+		IFS= read -rsn1 key || exit 0
+		case "$key" in
+			$'\e')
+				IFS= read -rsn2 -t "$esc_timeout" seq || seq=''
+				case "$seq" in
+					'[A' | 'OA') [ "$n" -gt 0 ] && cur=$((cur > 1 ? cur - 1 : n)) ;;
+					'[B' | 'OB') [ "$n" -gt 0 ] && cur=$((cur < n ? cur + 1 : 1)) ;;
+					'') exit 0 ;;
+				esac
+				;;
+			k) [ "$n" -gt 0 ] && cur=$((cur > 1 ? cur - 1 : n)) ;;
+			j) [ "$n" -gt 0 ] && cur=$((cur < n ? cur + 1 : 1)) ;;
+			' ') [ "$n" -gt 0 ] && checked[cur]=$((1 - checked[cur])) ;;
+			'') # enter: kill the checked rows, or the highlighted one when none checked
+				targets=''
+				for ((i = 1; i <= n; i++)); do
+					[ "${checked[i]}" = 1 ] && targets="$targets ${pids[i]}"
+				done
+				[ -z "$targets" ] && [ "$n" -gt 0 ] && targets="${pids[cur]}"
+				if [ -n "$targets" ]; then
+					printf '\n'
+					for pid in $targets; do
+						kill "$pid" 2> /dev/null && printf '  TERM -> %s\n' "$pid"
+					done
+					sleep 2
+					for pid in $targets; do
+						kill -0 "$pid" 2> /dev/null && kill -9 "$pid" 2> /dev/null && printf '  KILL -> %s\n' "$pid"
+					done
+					needs_refresh=1
+				fi
+				;;
+			a)
+				show_all=$((1 - show_all))
+				needs_refresh=1
+				;;
+			r) needs_refresh=1 ;;
+			q) exit 0 ;;
+		esac
+	done
+}
+
+case "${1:-}" in
+	watch) watch_loop ;;
+	ensure-watch) ensure_watch ;;
+	list) list_mode ;;
+	'') popup ;;
+	*)
+		echo "usage: herdr-ports [list|watch|ensure-watch]" >&2
+		exit 2
+		;;
+esac

@@ -1,0 +1,33 @@
+# herdr plugin manifest - install with:
+#   herdr plugin install Numbered-com/herdr-ports
+# Local dev: herdr plugin link /path/to/herdr-ports
+id = "numbered.ports"
+name = "Ports"
+version = "0.1.0"
+description = "Active dev servers per Space: sidebar $ports badge + kill popup"
+min_herdr_version = "0.7.4"
+platforms = ["linux", "macos"]
+
+# Popup listing listening servers grouped by Space; arrows + space to check,
+# enter kills (TERM, then KILL after 2s), esc quits
+[[panes]]
+id = "main"
+title = "ports"
+placement = "popup"
+width = "70%"
+height = "60%"
+command = ["./herdr-ports"]
+
+[[actions]]
+id = "open"
+title = "Open ports popup"
+contexts = ["workspace"]
+command = ["sh", "-c", "\"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin numbered.ports --entrypoint main --focus"]
+
+# Watcher autostart: every pane creation cheaply re-checks the singleton, so
+# the badge poller is alive whenever herdr is actually in use - no LaunchAgent,
+# no entrypoint wiring. It dies with the machine, not with herdr, which is fine:
+# it no-ops (and posts nothing) while the herdr server is down.
+[[events]]
+on = "pane.created"
+command = ["./herdr-ports", "ensure-watch"]
