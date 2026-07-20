@@ -300,6 +300,12 @@ popup() {
 		case "$rows" in '' | *[!0-9]*) rows=24 ;; esac
 		case "$cols" in '' | *[!0-9]*) cols=80 ;; esac
 
+		# COMMAND gets whatever width remains after the fixed columns (79
+		# cols); without this cap long lines wrap in narrow panes and shift
+		# every row below, breaking the click hitboxes
+		local cmdw=$((cols - 79))
+		[ "$cmdw" -lt 0 ] && cmdw=0
+
 		frame=$'\033[H'
 		suffix=''
 		[ "$show_all" = 1 ] && suffix=' (all listeners)'
@@ -317,7 +323,7 @@ popup() {
 				# column widths stay honest
 				[ "${checked[i]}" = 1 ] && chk=$'\033[38;5;114m'x$'\033[39m'
 				printf -v line '%s [%s] %-12.12s %-20s %-7s %-30s %s' \
-					"$mark" "$chk" "${spaces[i]}" "${portss[i]}" "${pids[i]}" "${paths[i]}" "${cmds[i]}"
+					"$mark" "$chk" "${spaces[i]}" "${portss[i]}" "${pids[i]}" "${paths[i]}" "${cmds[i]:0:cmdw}"
 				if [ "$i" = "$cur" ]; then
 					frame+=$'\033[48;5;237m'"$line"$'\033[K\033[0m\n'
 				else
