@@ -44,12 +44,16 @@ Then `herdr server reload-config`.
       SPACE        PORTS          PID     PATH                           COMMAND
 > [ ] webapp       :3000          48213   ~/dev/webapp                   next-server (v16)
   [x] api          :8080          48377   ~/dev/api                      bun run src/index.ts
+
+  ↑↓ move · space check · a all · r refresh
+                ↵ kill    esc close
 ```
 
-A status-line footer pins the commands to the bottom of the popup - hints on
-the left (or the outcome of the last kill), actions on the right - and every
-action in it is clickable. Mouse: click a row to check it, use the wheel to
-move. Keyboard:
+The footer mimics herdr's native settings modal: a dim hint line (replaced by
+the outcome of the last kill), then CTA chips - accent `↵ kill`, gray
+`esc close`. Set `HERDR_PORTS_ACCENT` (256-color index, default 223) to match
+your theme's accent. Hints and chips are all clickable. Mouse: click a row to
+check it, use the wheel to move. Keyboard:
 
 - arrows / `j` `k`: move - `space`: check - `enter`: kill checked rows (or the
   highlighted one when none checked); TERM first, KILL after 2s
