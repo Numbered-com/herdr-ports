@@ -42,8 +42,8 @@ Then `herdr server reload-config`.
 
 ```
       SPACE        PORTS          PID     PATH                           COMMAND
-> [ ] micadoni     :4461          43520   ~/.../micadoni/apps/web        next-server (v16.2.10)
-  [x] micadoni     :4839          43492   ~/.../micadoni/apps/sanity     node .../node_modules/.bin
+> [ ] webapp       :3000          48213   ~/dev/webapp                   next-server (v16)
+  [x] api          :8080          48377   ~/dev/api                      bun run src/index.ts
 ```
 
 A status-line footer pins the commands to the bottom of the popup - hints on
