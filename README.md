@@ -25,9 +25,9 @@ Plugins cannot inject sidebar rows or keybindings (herdr plugin v1), so add to
 your `config.toml`:
 
 ```toml
-# Show the badge on Space rows
+# Show the badge next to the Space title
 [ui.sidebar.spaces]
-rows = [["state_icon", "workspace"], ["branch", "git_status", "$ports"]]
+rows = [["state_icon", "workspace", "$ports"], ["branch", "git_status"]]
 
 # Open the popup with prefix+a
 [[keys.command]]
