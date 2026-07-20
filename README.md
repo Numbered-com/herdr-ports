@@ -53,7 +53,7 @@ Then `herdr server reload-config`.
 ## How the badge works
 
 `herdr-ports watch` polls every 5s (`HERDR_PORTS_INTERVAL`) and posts a
-`ports=[ports]` token (`HERDR_PORTS_BADGE`) as workspace metadata with a TTL,
+`ports=⇅` token (`HERDR_PORTS_BADGE`) as workspace metadata with a TTL,
 so the badge clears itself shortly after the last server dies. The watcher is
 a singleton started automatically by a `pane.created` event hook - no daemon
 setup needed.
