@@ -28,8 +28,9 @@
 set -u
 
 HERDR="${HERDR_BIN_PATH:-herdr}"
-# U+21C5: single-width in terminals, no emoji variant (no double-width risk)
-BADGE="${HERDR_PORTS_BADGE:-⇅}"
+# Nerd Font plug (U+F1E6), rendered by the *viewer's* terminal font - falls
+# back to a blank box without Nerd Font glyphs; override with e.g. "⇅" then
+BADGE="${HERDR_PORTS_BADGE:-}"
 INTERVAL="${HERDR_PORTS_INTERVAL:-5}"
 
 # One line per (pid, port) TCP listener: "pid<TAB>port"
