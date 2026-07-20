@@ -34,6 +34,10 @@ HERDR="${HERDR_BIN_PATH:-herdr}"
 # Private Use Area characters from metadata tokens.
 BADGE="${HERDR_PORTS_BADGE:-↯}"
 INTERVAL="${HERDR_PORTS_INTERVAL:-5}"
+# 256-color index for the primary CTA chip, mimicking herdr's native accent
+# buttons (223 ~ vesper's peach). Panes render with the terminal palette, not
+# herdr's theme, so the exact accent cannot be queried - override to match.
+ACCENT="${HERDR_PORTS_ACCENT:-223}"
 
 # One line per (pid, port) TCP listener: "pid<TAB>port"
 pid_ports() {
@@ -311,9 +315,9 @@ popup() {
 		# (\033[H, no full clear), every line erased to EOL (\033[K), leftovers
 		# erased with \033[J, all emitted in a single write. No subshells in
 		# this section - they are what made frames slow.
-		# Screen layout: title=1, header/none=2, rows=3..n+2,
+		# Screen layout: title=1, blank=2, header/none=3, rows=4..n+3,
 		# footer bar pinned on the pane's last line.
-		local frame='' line mark chk suffix fl fr pad rs r1s r1e r2s r2e r3s r3e size
+		local frame='' line mark chk suffix fl size c1 c2 cw cstart
 		size=$(stty size 2> /dev/null) || size=''
 		rows=${size%% *}
 		cols=${size##* }
@@ -329,7 +333,7 @@ popup() {
 		frame=$'\033[H'
 		suffix=''
 		[ "$show_all" = 1 ] && suffix=' (all listeners)'
-		frame+=$'\033[1m'"Active dev servers$suffix"$'\033[0m\033[K\n'
+		frame+=$'\033[1m'"Active dev servers$suffix"$'\033[0m\033[K\n\033[K\n'
 		if [ "$n" = 0 ]; then
 			frame+='  (none - "a" includes listeners outside herdr workspaces)'$'\033[K\n'
 		else
@@ -352,46 +356,40 @@ popup() {
 			done
 		fi
 
-		# Footer bar: hints left, actions right (screenshot-style status line).
-		# Click hitboxes are recorded while the segments are built, so they
-		# follow label widths; right-side spans are offset once rs is known.
+		# Footer, native-settings style: a dim hint line, then CTA chips like
+		# herdr's own (accent primary, gray secondary). Every segment records
+		# its line + column span, so hints and chips are all clickable.
 		bt3='a all'
 		[ "$show_all" = 1 ] && bt3='a spaces'
+		btn_line[2]=$((rows - 1))
+		btn_line[3]=$((rows - 1))
 		if [ -n "$status" ]; then
-			fl=" $status"
+			fl="  $status"
 			status=''
+			btn_start[2]=0 btn_end[2]=0 btn_start[3]=0 btn_end[3]=0
 		else
-			fl=" ↯ $n · click/space check"
+			fl='  ↑↓ move · space check · '
+			btn_start[3]=$((${#fl} + 1))
+			fl+="$bt3"
+			btn_end[3]=${#fl}
+			fl+=' · '
+			btn_start[2]=$((${#fl} + 1))
+			fl+='r refresh'
+			btn_end[2]=${#fl}
 		fi
-		fl+=' · '
-		btn_start[1]=$((${#fl} + 1))
-		fl+='enter kill'
-		btn_end[1]=${#fl}
-		fr=''
-		r1s=$((${#fr} + 1))
-		fr+="$bt3"
-		r1e=${#fr}
-		fr+=' · '
-		r2s=$((${#fr} + 1))
-		fr+='r refresh'
-		r2e=${#fr}
-		fr+=' · '
-		r3s=$((${#fr} + 1))
-		fr+='esc quit'
-		r3e=${#fr}
-		fr+=' '
-		rs=$((cols - ${#fr} + 1))
-		[ "$rs" -lt $((${#fl} + 2)) ] && rs=$((${#fl} + 2))
-		btn_start[3]=$((rs + r1s - 1))
-		btn_end[3]=$((rs + r1e - 1))
-		btn_start[2]=$((rs + r2s - 1))
-		btn_end[2]=$((rs + r2e - 1))
-		btn_start[4]=$((rs + r3s - 1))
-		btn_end[4]=$((rs + r3e - 1))
-		pad=$((rs - ${#fl} - 1))
-		[ "$pad" -lt 0 ] && pad=0
-		printf -v line '%s%*s%s' "$fl" "$pad" '' "$fr"
-		frame+=$'\033[J\033['"$rows"$';1H\033[48;5;236m\033[38;5;250m'"$line"$'\033[K\033[0m'
+		c1=' ↵ kill '
+		c2=' esc close '
+		cw=$((${#c1} + 2 + ${#c2}))
+		cstart=$(((cols - cw) / 2))
+		[ "$cstart" -lt 1 ] && cstart=1
+		btn_line[1]=$rows
+		btn_start[1]=$cstart
+		btn_end[1]=$((cstart + ${#c1} - 1))
+		btn_line[4]=$rows
+		btn_start[4]=$((btn_end[1] + 3))
+		btn_end[4]=$((btn_start[4] + ${#c2} - 1))
+		frame+=$'\033[J\033['"$((rows - 1))"$';1H\033[38;5;244m'"$fl"$'\033[K\033[0m'
+		frame+=$'\033['"$rows"$';'"$cstart"$'H\033[48;5;'"$ACCENT"$'m\033[38;5;16m'"$c1"$'\033[0m  \033[48;5;238m\033[38;5;253m'"$c2"$'\033[0m\033[K'
 		printf '%s' "$frame"
 
 		IFS= read -rsn1 key || exit 0
@@ -425,13 +423,13 @@ popup() {
 							[ "$term" = M ] || continue # act on press, ignore release
 							IFS=';' read -r mb mx my <<< "$ev"
 							case "$mb" in
-								0) # left click: row = toggle checkbox, footer = action
-									if [ "$my" -ge 3 ] && [ "$my" -le "$((n + 2))" ]; then
-										cur=$((my - 2))
+								0) # left click: row = toggle checkbox, footer segment = action
+									if [ "$my" -ge 4 ] && [ "$my" -le "$((n + 3))" ]; then
+										cur=$((my - 3))
 										checked[cur]=$((1 - checked[cur]))
-									elif [ "$my" = "$rows" ]; then
+									else
 										for k in 1 2 3 4; do
-											if [ "$mx" -ge "${btn_start[k]:-0}" ] && [ "$mx" -le "${btn_end[k]:-0}" ]; then
+											if [ "$my" = "${btn_line[k]:-0}" ] && [ "$mx" -ge "${btn_start[k]:-0}" ] && [ "$mx" -le "${btn_end[k]:-0}" ]; then
 												case "$k" in
 													1) kill_targets ;;
 													2) needs_refresh=1 ;;
