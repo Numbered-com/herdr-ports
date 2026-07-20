@@ -204,7 +204,9 @@ popup() {
 	# not local: the EXIT trap fires after popup() returned, under set -u
 	tmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports.XXXXXX")
 	trap 'rm -rf "$tmp"; printf "\033[?25h"' EXIT
-	printf '\033[?25l'
+	# full clear only once at entry - per-keypress frames home the cursor and
+	# overwrite in place instead, which is what kills the flicker
+	printf '\033[?25l\033[2J\033[H'
 
 	while :; do
 		if [ "$needs_refresh" = 1 ]; then
@@ -225,7 +227,9 @@ popup() {
 				spaces[n]=$space
 				pids[n]=$pid
 				portss[n]=$ports
-				paths[n]=$cwd
+				# shortened once here: the render loop below runs on every
+				# keypress and must stay free of subshells to avoid flicker
+				paths[n]=$(shorten "$cwd")
 				cmds[n]=$cmd
 				checked[n]=0
 				case "$prev" in *" $pid "*) checked[n]=1 ;; esac
@@ -235,21 +239,34 @@ popup() {
 			needs_refresh=0
 		fi
 
-		printf '\033[2J\033[H'
-		printf 'Active dev servers%s\n\n' "$([ "$show_all" = 1 ] && echo ' (all listeners)')"
+		# Flicker-free redraw: one frame assembled in memory, cursor homed
+		# (\033[H, no full clear), every line erased to EOL (\033[K), leftovers
+		# below erased at the end (\033[J), all emitted in a single write.
+		# No subshells in this section - they are what made frames slow.
+		local frame='' line mark chk suffix
+		frame=$'\033[H'
+		suffix=''
+		[ "$show_all" = 1 ] && suffix=' (all listeners)'
+		frame+="Active dev servers$suffix"$'\033[K\n\033[K\n'
 		if [ "$n" = 0 ]; then
-			echo '  (none - "a" includes listeners outside herdr workspaces)'
+			frame+='  (none - "a" includes listeners outside herdr workspaces)'$'\033[K\n'
 		else
-			printf '      %-12s %-20s %-7s %-30s %s\n' 'SPACE' 'PORTS' 'PID' 'PATH' 'COMMAND'
+			printf -v line '      %-12s %-20s %-7s %-30s %s' 'SPACE' 'PORTS' 'PID' 'PATH' 'COMMAND'
+			frame+="$line"$'\033[K\n'
 			for ((i = 1; i <= n; i++)); do
-				printf '%s [%s] %-12.12s %-20s %-7s %-30s %s\n' \
-					"$([ "$i" = "$cur" ] && printf '>' || printf ' ')" \
-					"$([ "${checked[i]}" = 1 ] && printf 'x' || printf ' ')" \
-					"${spaces[i]}" "${portss[i]}" "${pids[i]}" "$(shorten "${paths[i]}")" "${cmds[i]}"
+				mark=' '
+				[ "$i" = "$cur" ] && mark='>'
+				chk=' '
+				[ "${checked[i]}" = 1 ] && chk='x'
+				printf -v line '%s [%s] %-12.12s %-20s %-7s %-30s %s' \
+					"$mark" "$chk" "${spaces[i]}" "${portss[i]}" "${pids[i]}" "${paths[i]}" "${cmds[i]}"
+				frame+="$line"$'\033[K\n'
 			done
 		fi
-		printf '\n  up/down move   space check   enter kill   a %s   r refresh   esc quit\n' \
-			"$([ "$show_all" = 1 ] && echo 'workspace only' || echo 'all listeners')"
+		suffix='all listeners'
+		[ "$show_all" = 1 ] && suffix='workspace only'
+		frame+=$'\033[K\n'"  up/down move   space check   enter kill   a $suffix   r refresh   esc quit"$'\033[K\n\033[J'
+		printf '%s' "$frame"
 
 		IFS= read -rsn1 key || exit 0
 		case "$key" in
