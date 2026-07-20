@@ -197,19 +197,52 @@ list_mode() {
 	done < "$tmp/rows"
 }
 
+# Helpers below run inside popup() via bash dynamic scoping: they read and
+# mutate its locals (n, cur, checked, pids, needs_refresh).
+cursor_up() {
+	[ "$n" -gt 0 ] && cur=$((cur > 1 ? cur - 1 : n))
+	return 0
+}
+
+cursor_down() {
+	[ "$n" -gt 0 ] && cur=$((cur < n ? cur + 1 : 1))
+	return 0
+}
+
+# TERM the checked rows (or the highlighted one when none checked), KILL
+# survivors after 2s
+kill_targets() {
+	local targets='' i pid
+	for ((i = 1; i <= n; i++)); do
+		[ "${checked[i]}" = 1 ] && targets="$targets ${pids[i]}"
+	done
+	[ -z "$targets" ] && [ "$n" -gt 0 ] && targets="${pids[cur]}"
+	[ -n "$targets" ] || return 0
+	printf '\n'
+	for pid in $targets; do
+		kill "$pid" 2> /dev/null && printf '  TERM -> %s\n' "$pid"
+	done
+	sleep 2
+	for pid in $targets; do
+		kill -0 "$pid" 2> /dev/null && kill -9 "$pid" 2> /dev/null && printf '  KILL -> %s\n' "$pid"
+	done
+	needs_refresh=1
+}
+
 popup() {
-	local show_all=0 n='' cur=1 needs_refresh=1 i key seq esc_timeout prev targets
-	local space pid ports cwd cmd
+	local show_all=0 n='' cur=1 needs_refresh=1 i key seq esc_timeout prev
+	local space pid ports cwd cmd c1 c2 mbuf mb mx my bt3 btxt k
 	# bash 3.2 (stock macOS) only accepts integer read timeouts: bare-Escape
 	# detection costs up to 1s there, arrows are unaffected either way
 	esc_timeout=1
 	[ "${BASH_VERSINFO[0]}" -ge 4 ] && esc_timeout=0.05
 	# not local: the EXIT trap fires after popup() returned, under set -u
 	tmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports.XXXXXX")
-	trap 'rm -rf "$tmp"; printf "\033[?25h"' EXIT
+	trap 'rm -rf "$tmp"; printf "\033[?1006l\033[?1000l\033[?25h"' EXIT
 	# full clear only once at entry - per-keypress frames home the cursor and
-	# overwrite in place instead, which is what kills the flicker
-	printf '\033[?25l\033[2J\033[H'
+	# overwrite in place instead, which is what kills the flicker. SGR mouse
+	# reporting (1000h+1006h): herdr forwards mouse to pane apps requesting it.
+	printf '\033[?25l\033[2J\033[H\033[?1000h\033[?1006h'
 
 	while :; do
 		if [ "$needs_refresh" = 1 ]; then
@@ -266,42 +299,78 @@ popup() {
 				frame+="$line"$'\033[K\n'
 			done
 		fi
-		suffix='all listeners'
-		[ "$show_all" = 1 ] && suffix='workspace only'
-		frame+=$'\033[K\n'"  up/down move   space check   enter kill   a $suffix   r refresh   esc quit"$'\033[K\n\033[J'
+		# CTA row: hitboxes are recorded while the line is built, so click
+		# mapping follows label widths (the third label changes with show_all).
+		# Screen layout: title=1, blank=2, header/none=3, rows=4..n+3,
+		# blank=n+4, buttons=n+5.
+		bt3='All listeners'
+		[ "$show_all" = 1 ] && bt3='Spaces only'
+		btn_lbl[1]='Kill'
+		btn_lbl[2]='Refresh'
+		btn_lbl[3]=$bt3
+		btn_lbl[4]='Quit'
+		btxt='  '
+		for k in 1 2 3 4; do
+			btn_start[k]=$((${#btxt} + 1))
+			btxt+="[ ${btn_lbl[k]} ]"
+			btn_end[k]=${#btxt}
+			btxt+='   '
+		done
+		frame+=$'\033[K\n'"$btxt"$'\033[K\n'
+		frame+='  click/space check   wheel/arrows move   enter kill   a toggle   r refresh   esc quit'$'\033[K\n\033[J'
 		printf '%s' "$frame"
 
 		IFS= read -rsn1 key || exit 0
 		case "$key" in
 			$'\e')
-				IFS= read -rsn2 -t "$esc_timeout" seq || seq=''
-				case "$seq" in
-					'[A' | 'OA') [ "$n" -gt 0 ] && cur=$((cur > 1 ? cur - 1 : n)) ;;
-					'[B' | 'OB') [ "$n" -gt 0 ] && cur=$((cur < n ? cur + 1 : 1)) ;;
-					'') exit 0 ;;
+				# bare Escape quits; otherwise decode CSI: arrows ([A/[B, OA/OB)
+				# or an SGR mouse event ([<b;x;yM for press, m for release)
+				IFS= read -rsn1 -t "$esc_timeout" c1 || exit 0
+				case "$c1" in '[' | 'O') ;; *) continue ;; esac
+				IFS= read -rsn1 -t "$esc_timeout" c2 || continue
+				case "$c2" in
+					A) cursor_up ;;
+					B) cursor_down ;;
+					'<')
+						mbuf=''
+						while IFS= read -rsn1 -t 1 c2; do
+							case "$c2" in M | m) break ;; esac
+							mbuf+=$c2
+						done
+						[ "$c2" = M ] || continue # act on press only, ignore release
+						IFS=';' read -r mb mx my <<< "$mbuf"
+						case "$mb" in
+							0) # left click: row = toggle its checkbox, CTA = its action
+								if [ "$my" -ge 4 ] && [ "$my" -le "$((n + 3))" ]; then
+									cur=$((my - 3))
+									checked[cur]=$((1 - checked[cur]))
+								elif [ "$my" = "$((n + 5))" ]; then
+									for k in 1 2 3 4; do
+										if [ "$mx" -ge "${btn_start[k]}" ] && [ "$mx" -le "${btn_end[k]}" ]; then
+											case "$k" in
+												1) kill_targets ;;
+												2) needs_refresh=1 ;;
+												3)
+													show_all=$((1 - show_all))
+													needs_refresh=1
+													;;
+												4) exit 0 ;;
+											esac
+											break
+										fi
+									done
+								fi
+								;;
+							64) cursor_up ;;
+							65) cursor_down ;;
+						esac
+						;;
 				esac
 				;;
-			k) [ "$n" -gt 0 ] && cur=$((cur > 1 ? cur - 1 : n)) ;;
-			j) [ "$n" -gt 0 ] && cur=$((cur < n ? cur + 1 : 1)) ;;
+			k) cursor_up ;;
+			j) cursor_down ;;
 			' ') [ "$n" -gt 0 ] && checked[cur]=$((1 - checked[cur])) ;;
-			'') # enter: kill the checked rows, or the highlighted one when none checked
-				targets=''
-				for ((i = 1; i <= n; i++)); do
-					[ "${checked[i]}" = 1 ] && targets="$targets ${pids[i]}"
-				done
-				[ -z "$targets" ] && [ "$n" -gt 0 ] && targets="${pids[cur]}"
-				if [ -n "$targets" ]; then
-					printf '\n'
-					for pid in $targets; do
-						kill "$pid" 2> /dev/null && printf '  TERM -> %s\n' "$pid"
-					done
-					sleep 2
-					for pid in $targets; do
-						kill -0 "$pid" 2> /dev/null && kill -9 "$pid" 2> /dev/null && printf '  KILL -> %s\n' "$pid"
-					done
-					needs_refresh=1
-				fi
-				;;
+			'') kill_targets ;; # enter
 			a)
 				show_all=$((1 - show_all))
 				needs_refresh=1

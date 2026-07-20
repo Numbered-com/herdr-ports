@@ -46,6 +46,9 @@ Then `herdr server reload-config`.
   [x] micadoni     :4839          43492   ~/.../micadoni/apps/sanity     node .../node_modules/.bin
 ```
 
+Mouse: click a row to check it, use the wheel to move, and click the
+`[ Kill ] [ Refresh ] [ All listeners ] [ Quit ]` buttons. Keyboard:
+
 - arrows / `j` `k`: move - `space`: check - `enter`: kill checked rows (or the
   highlighted one when none checked); TERM first, KILL after 2s
 - `a`: include listeners outside herdr workspaces - `r`: refresh - `esc` / `q`: quit
