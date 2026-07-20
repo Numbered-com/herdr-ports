@@ -53,12 +53,11 @@ Then `herdr server reload-config`.
 ## How the badge works
 
 `herdr-ports watch` polls every 5s (`HERDR_PORTS_INTERVAL`) and posts a
-`ports=🔌` token (`HERDR_PORTS_BADGE`) as workspace metadata with a TTL,
+`ports=↯` token (`HERDR_PORTS_BADGE`) as workspace metadata with a TTL,
 so the badge clears itself shortly after the last server dies. Nerd Font
 glyphs cannot be used here: herdr strips Private Use Area characters from
-metadata tokens. Set `HERDR_PORTS_BADGE="⇅"` for a monochrome single-width
-badge. The watcher is a singleton started automatically by a `pane.created`
-event hook - no daemon setup needed.
+metadata tokens. The watcher is a singleton started automatically by a
+`pane.created` event hook - no daemon setup needed.
 
 ## CLI
 
