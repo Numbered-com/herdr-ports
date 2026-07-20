@@ -175,7 +175,12 @@ build_rows() {
 		}
 	' "$tmp/labels" "$tmp/pidws" "$tmp/ports" "$tmp/cwds" | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2 | cut -f3- \
 		| while IFS=$'\t' read -r space pid ports cwd; do
-			cmd=$(ps -o args= -p "$pid" 2> /dev/null | head -1 | cut -c1-48)
+			cmd=$(ps -o args= -p "$pid" 2> /dev/null | head -1)
+			# tabs would shift the TSV fields read back by the consumers, and
+			# bash substring truncation is character-based, unlike cut -c
+			# which can slice a multibyte UTF-8 char in half
+			cmd=${cmd//$'\t'/ }
+			cmd=${cmd:0:60}
 			printf '%s\t%s\t%s\t%s\t%s\n' "$space" "$pid" "$ports" "$cwd" "${cmd:-?}"
 		done
 }
@@ -237,17 +242,32 @@ kill_targets() {
 # read -t, which would stall a bare Escape for a full second. When stdin is
 # not a tty (tests, pipes), dd just reads the pending buffer.
 read_esc_tail() {
-	local saved=''
+	local saved='' tries=0
 	saved=$(stty -g 2> /dev/null) || true
 	[ -n "$saved" ] && stty -icanon -echo min 0 time 1 2> /dev/null
 	seq=$(dd bs=64 count=1 2> /dev/null)
+	# a burst can split across read(2) calls: keep reading while the tail is
+	# an obviously unfinished sequence (lone CSI/SS3 introducer, or a mouse
+	# event missing its M/m terminator), else the dropped half would be
+	# re-read later as garbage keystrokes
+	while [ "$tries" -lt 4 ]; do
+		case "$seq" in
+			'[' | 'O') ;;
+			'[<'*)
+				case "$seq" in *[Mm]*) break ;; esac
+				;;
+			*) break ;;
+		esac
+		seq="$seq$(dd bs=64 count=1 2> /dev/null)"
+		tries=$((tries + 1))
+	done
 	[ -n "$saved" ] && stty "$saved" 2> /dev/null
 	return 0
 }
 
 popup() {
 	local show_all=0 n='' cur=1 needs_refresh=1 i key seq prev status=''
-	local space pid ports cwd cmd mbuf mb mx my bt3 k ev term rows=24 cols=80
+	local space pid ports cwd cmd mbuf body mb mx my bt3 k ev term rows=24 cols=80
 	# not local: the EXIT trap fires after popup() returned, under set -u
 	tmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports.XXXXXX")
 	trap 'rm -rf "$tmp"; printf "\033[?1006l\033[?1000l\033[?25h"' EXIT
@@ -377,48 +397,62 @@ popup() {
 		IFS= read -rsn1 key || exit 0
 		case "$key" in
 			$'\e')
-				# bare Escape (empty tail) quits; otherwise decode the burst:
-				# arrows ([A/[B, OA/OB) or an SGR mouse event ([<b;x;yM press,
-				# m release)
+				# bare Escape (empty tail) quits; otherwise process EVERY
+				# event in the burst - fast wheel scrolls and clicks queued
+				# during kill_targets' sleep arrive several per read, and
+				# handling only the first would drop the rest
 				read_esc_tail
-				case "$seq" in
-					'') exit 0 ;;
-					'[A'* | 'OA'*) cursor_up ;;
-					'[B'* | 'OB'*) cursor_down ;;
-					'[<'*)
-						# first event of the burst only
-						mbuf=${seq#??}
-						ev=${mbuf%%[Mm]*}
-						term=${mbuf:${#ev}:1}
-						[ "$term" = M ] || continue # act on press, ignore release
-						IFS=';' read -r mb mx my <<< "$ev"
-						case "$mb" in
-							0) # left click: row = toggle checkbox, footer = action
-								if [ "$my" -ge 4 ] && [ "$my" -le "$((n + 3))" ]; then
-									cur=$((my - 3))
-									checked[cur]=$((1 - checked[cur]))
-								elif [ "$my" = "$rows" ]; then
-									for k in 1 2 3 4; do
-										if [ "$mx" -ge "${btn_start[k]:-0}" ] && [ "$mx" -le "${btn_end[k]:-0}" ]; then
-											case "$k" in
-												1) kill_targets ;;
-												2) needs_refresh=1 ;;
-												3)
-													show_all=$((1 - show_all))
-													needs_refresh=1
-													;;
-												4) exit 0 ;;
-											esac
-											break
-										fi
-									done
-								fi
-								;;
-							64) cursor_up ;;
-							65) cursor_down ;;
-						esac
-						;;
-				esac
+				[ -z "$seq" ] && exit 0
+				mbuf=$seq
+				while [ -n "$mbuf" ]; do
+					case "$mbuf" in
+						$'\e'*) mbuf=${mbuf#$'\e'} ;;
+						'[A'* | 'OA'*)
+							cursor_up
+							mbuf=${mbuf:2}
+							;;
+						'[B'* | 'OB'*)
+							cursor_down
+							mbuf=${mbuf:2}
+							;;
+						'[<'*)
+							# SGR event: [<b;x;yM press, m release
+							body=${mbuf#??}
+							ev=${body%%[Mm]*}
+							[ "$ev" = "$body" ] && break # no terminator: incomplete tail
+							term=${body:${#ev}:1}
+							mbuf=${body:$((${#ev} + 1))}
+							[ "$term" = M ] || continue # act on press, ignore release
+							IFS=';' read -r mb mx my <<< "$ev"
+							case "$mb" in
+								0) # left click: row = toggle checkbox, footer = action
+									if [ "$my" -ge 4 ] && [ "$my" -le "$((n + 3))" ]; then
+										cur=$((my - 3))
+										checked[cur]=$((1 - checked[cur]))
+									elif [ "$my" = "$rows" ]; then
+										for k in 1 2 3 4; do
+											if [ "$mx" -ge "${btn_start[k]:-0}" ] && [ "$mx" -le "${btn_end[k]:-0}" ]; then
+												case "$k" in
+													1) kill_targets ;;
+													2) needs_refresh=1 ;;
+													3)
+														show_all=$((1 - show_all))
+														needs_refresh=1
+														;;
+													4) exit 0 ;;
+												esac
+												break
+											fi
+										done
+									fi
+									;;
+								64) cursor_up ;;
+								65) cursor_down ;;
+							esac
+							;;
+						*) break ;;
+					esac
+				done
 				;;
 			k) cursor_up ;;
 			j) cursor_down ;;
