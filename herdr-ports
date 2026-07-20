@@ -23,8 +23,9 @@
 # against the cwds of the workspace's panes, so servers started outside herdr
 # still show up as long as they run inside a workspace directory.
 # Requires jq; uses lsof (macOS/Linux) or falls back to ss (Linux).
-# Written for bash 3.2 (stock macOS): no mapfile, no associative arrays,
-# integer-only read timeouts.
+# Written for bash 3.2 (stock macOS): no mapfile, no associative arrays; and
+# since read -t only takes whole seconds there, escape-sequence tails are read
+# via termios VMIN=0/VTIME=1 (stty + dd) so a bare Escape quits in ~0.1s.
 set -u
 
 HERDR="${HERDR_BIN_PATH:-herdr}"
@@ -210,32 +211,43 @@ cursor_down() {
 }
 
 # TERM the checked rows (or the highlighted one when none checked), KILL
-# survivors after 2s
+# survivors after 2s. Outcome goes to $status, rendered in the footer bar.
 kill_targets() {
-	local targets='' i pid
+	local targets='' i pid killed='' forced=''
 	for ((i = 1; i <= n; i++)); do
 		[ "${checked[i]}" = 1 ] && targets="$targets ${pids[i]}"
 	done
 	[ -z "$targets" ] && [ "$n" -gt 0 ] && targets="${pids[cur]}"
 	[ -n "$targets" ] || return 0
-	printf '\n'
 	for pid in $targets; do
-		kill "$pid" 2> /dev/null && printf '  TERM -> %s\n' "$pid"
+		kill "$pid" 2> /dev/null && killed="$killed $pid"
 	done
 	sleep 2
 	for pid in $targets; do
-		kill -0 "$pid" 2> /dev/null && kill -9 "$pid" 2> /dev/null && printf '  KILL -> %s\n' "$pid"
+		kill -0 "$pid" 2> /dev/null && kill -9 "$pid" 2> /dev/null && forced="$forced $pid"
 	done
+	status="TERM →$killed"
+	[ -n "$forced" ] && status="$status · KILL →$forced"
 	needs_refresh=1
 }
 
+# Grab whatever bytes follow an ESC into $seq: arrows and mouse events arrive
+# as one burst, so a single read returns them at once, while a lone Escape
+# yields nothing after VTIME (0.1s). This sidesteps bash 3.2's integer-only
+# read -t, which would stall a bare Escape for a full second. When stdin is
+# not a tty (tests, pipes), dd just reads the pending buffer.
+read_esc_tail() {
+	local saved=''
+	saved=$(stty -g 2> /dev/null) || true
+	[ -n "$saved" ] && stty -icanon -echo min 0 time 1 2> /dev/null
+	seq=$(dd bs=64 count=1 2> /dev/null)
+	[ -n "$saved" ] && stty "$saved" 2> /dev/null
+	return 0
+}
+
 popup() {
-	local show_all=0 n='' cur=1 needs_refresh=1 i key seq esc_timeout prev
-	local space pid ports cwd cmd c1 c2 mbuf mb mx my bt3 btxt k
-	# bash 3.2 (stock macOS) only accepts integer read timeouts: bare-Escape
-	# detection costs up to 1s there, arrows are unaffected either way
-	esc_timeout=1
-	[ "${BASH_VERSINFO[0]}" -ge 4 ] && esc_timeout=0.05
+	local show_all=0 n='' cur=1 needs_refresh=1 i key seq prev status=''
+	local space pid ports cwd cmd mbuf mb mx my bt3 k ev term rows=24 cols=80
 	# not local: the EXIT trap fires after popup() returned, under set -u
 	tmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports.XXXXXX")
 	trap 'rm -rf "$tmp"; printf "\033[?1006l\033[?1000l\033[?25h"' EXIT
@@ -277,76 +289,111 @@ popup() {
 
 		# Flicker-free redraw: one frame assembled in memory, cursor homed
 		# (\033[H, no full clear), every line erased to EOL (\033[K), leftovers
-		# below erased at the end (\033[J), all emitted in a single write.
-		# No subshells in this section - they are what made frames slow.
-		local frame='' line mark chk suffix
+		# erased with \033[J, all emitted in a single write. No subshells in
+		# this section - they are what made frames slow.
+		# Screen layout: title=1, blank=2, header/none=3, rows=4..n+3,
+		# footer bar pinned on the pane's last line.
+		local frame='' line mark chk suffix fl fr pad rs r1s r1e r2s r2e r3s r3e size
+		size=$(stty size 2> /dev/null) || size=''
+		rows=${size%% *}
+		cols=${size##* }
+		case "$rows" in '' | *[!0-9]*) rows=24 ;; esac
+		case "$cols" in '' | *[!0-9]*) cols=80 ;; esac
+
 		frame=$'\033[H'
 		suffix=''
 		[ "$show_all" = 1 ] && suffix=' (all listeners)'
-		frame+="Active dev servers$suffix"$'\033[K\n\033[K\n'
+		frame+=$'\033[1m'"Active dev servers$suffix"$'\033[0m\033[K\n\033[K\n'
 		if [ "$n" = 0 ]; then
 			frame+='  (none - "a" includes listeners outside herdr workspaces)'$'\033[K\n'
 		else
 			printf -v line '      %-12s %-20s %-7s %-30s %s' 'SPACE' 'PORTS' 'PID' 'PATH' 'COMMAND'
-			frame+="$line"$'\033[K\n'
+			frame+=$'\033[38;5;244m'"$line"$'\033[0m\033[K\n'
 			for ((i = 1; i <= n; i++)); do
 				mark=' '
 				[ "$i" = "$cur" ] && mark='>'
 				chk=' '
-				[ "${checked[i]}" = 1 ] && chk='x'
+				# colored, but always exactly one visible char so printf's
+				# column widths stay honest
+				[ "${checked[i]}" = 1 ] && chk=$'\033[38;5;114m'x$'\033[39m'
 				printf -v line '%s [%s] %-12.12s %-20s %-7s %-30s %s' \
 					"$mark" "$chk" "${spaces[i]}" "${portss[i]}" "${pids[i]}" "${paths[i]}" "${cmds[i]}"
-				frame+="$line"$'\033[K\n'
+				if [ "$i" = "$cur" ]; then
+					frame+=$'\033[48;5;237m'"$line"$'\033[K\033[0m\n'
+				else
+					frame+="$line"$'\033[K\n'
+				fi
 			done
 		fi
-		# CTA row: hitboxes are recorded while the line is built, so click
-		# mapping follows label widths (the third label changes with show_all).
-		# Screen layout: title=1, blank=2, header/none=3, rows=4..n+3,
-		# blank=n+4, buttons=n+5.
-		bt3='All listeners'
-		[ "$show_all" = 1 ] && bt3='Spaces only'
-		btn_lbl[1]='Kill'
-		btn_lbl[2]='Refresh'
-		btn_lbl[3]=$bt3
-		btn_lbl[4]='Quit'
-		btxt='  '
-		for k in 1 2 3 4; do
-			btn_start[k]=$((${#btxt} + 1))
-			btxt+="[ ${btn_lbl[k]} ]"
-			btn_end[k]=${#btxt}
-			btxt+='   '
-		done
-		frame+=$'\033[K\n'"$btxt"$'\033[K\n'
-		frame+='  click/space check   wheel/arrows move   enter kill   a toggle   r refresh   esc quit'$'\033[K\n\033[J'
+
+		# Footer bar: hints left, actions right (screenshot-style status line).
+		# Click hitboxes are recorded while the segments are built, so they
+		# follow label widths; right-side spans are offset once rs is known.
+		bt3='a all'
+		[ "$show_all" = 1 ] && bt3='a spaces'
+		if [ -n "$status" ]; then
+			fl=" $status"
+			status=''
+		else
+			fl=" ↯ $n · click/space check"
+		fi
+		fl+=' · '
+		btn_start[1]=$((${#fl} + 1))
+		fl+='enter kill'
+		btn_end[1]=${#fl}
+		fr=''
+		r1s=$((${#fr} + 1))
+		fr+="$bt3"
+		r1e=${#fr}
+		fr+=' · '
+		r2s=$((${#fr} + 1))
+		fr+='r refresh'
+		r2e=${#fr}
+		fr+=' · '
+		r3s=$((${#fr} + 1))
+		fr+='esc quit'
+		r3e=${#fr}
+		fr+=' '
+		rs=$((cols - ${#fr} + 1))
+		[ "$rs" -lt $((${#fl} + 2)) ] && rs=$((${#fl} + 2))
+		btn_start[3]=$((rs + r1s - 1))
+		btn_end[3]=$((rs + r1e - 1))
+		btn_start[2]=$((rs + r2s - 1))
+		btn_end[2]=$((rs + r2e - 1))
+		btn_start[4]=$((rs + r3s - 1))
+		btn_end[4]=$((rs + r3e - 1))
+		pad=$((rs - ${#fl} - 1))
+		[ "$pad" -lt 0 ] && pad=0
+		printf -v line '%s%*s%s' "$fl" "$pad" '' "$fr"
+		frame+=$'\033[J\033['"$rows"$';1H\033[48;5;236m\033[38;5;250m'"$line"$'\033[K\033[0m'
 		printf '%s' "$frame"
 
 		IFS= read -rsn1 key || exit 0
 		case "$key" in
 			$'\e')
-				# bare Escape quits; otherwise decode CSI: arrows ([A/[B, OA/OB)
-				# or an SGR mouse event ([<b;x;yM for press, m for release)
-				IFS= read -rsn1 -t "$esc_timeout" c1 || exit 0
-				case "$c1" in '[' | 'O') ;; *) continue ;; esac
-				IFS= read -rsn1 -t "$esc_timeout" c2 || continue
-				case "$c2" in
-					A) cursor_up ;;
-					B) cursor_down ;;
-					'<')
-						mbuf=''
-						while IFS= read -rsn1 -t 1 c2; do
-							case "$c2" in M | m) break ;; esac
-							mbuf+=$c2
-						done
-						[ "$c2" = M ] || continue # act on press only, ignore release
-						IFS=';' read -r mb mx my <<< "$mbuf"
+				# bare Escape (empty tail) quits; otherwise decode the burst:
+				# arrows ([A/[B, OA/OB) or an SGR mouse event ([<b;x;yM press,
+				# m release)
+				read_esc_tail
+				case "$seq" in
+					'') exit 0 ;;
+					'[A'* | 'OA'*) cursor_up ;;
+					'[B'* | 'OB'*) cursor_down ;;
+					'[<'*)
+						# first event of the burst only
+						mbuf=${seq#??}
+						ev=${mbuf%%[Mm]*}
+						term=${mbuf:${#ev}:1}
+						[ "$term" = M ] || continue # act on press, ignore release
+						IFS=';' read -r mb mx my <<< "$ev"
 						case "$mb" in
-							0) # left click: row = toggle its checkbox, CTA = its action
+							0) # left click: row = toggle checkbox, footer = action
 								if [ "$my" -ge 4 ] && [ "$my" -le "$((n + 3))" ]; then
 									cur=$((my - 3))
 									checked[cur]=$((1 - checked[cur]))
-								elif [ "$my" = "$((n + 5))" ]; then
+								elif [ "$my" = "$rows" ]; then
 									for k in 1 2 3 4; do
-										if [ "$mx" -ge "${btn_start[k]}" ] && [ "$mx" -le "${btn_end[k]}" ]; then
+										if [ "$mx" -ge "${btn_start[k]:-0}" ] && [ "$mx" -le "${btn_end[k]:-0}" ]; then
 											case "$k" in
 												1) kill_targets ;;
 												2) needs_refresh=1 ;;
