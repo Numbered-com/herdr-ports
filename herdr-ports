@@ -133,6 +133,13 @@ match_join() {
 	' "$1" - | sort -u
 }
 
+# workspace_ids (one per line, sorted -u) running >=1 attributed TCP listener.
+# Shared by the watcher (post the badge) and the kill path (diff before/after
+# to clear the badge for Spaces that just lost their last server).
+active_workspaces() {
+	pid_ports | pid_cwds | match_join <(workspace_cwds) | cut -f3 | sort -u
+}
+
 pidfile_path() {
 	echo "/tmp/herdr-ports-watcher.$(id -u).pid"
 }
@@ -148,17 +155,29 @@ watch_loop() {
 	echo $$ > "$(pidfile_path)"
 	trap 'rm -f "$(pidfile_path)"' EXIT
 
-	# TTL outlives one missed poll so the badge does not flicker, but clears
-	# itself shortly after the last server dies - no explicit cleanup needed.
+	# The TTL is only a backstop (a missed poll must not flicker the badge, and a
+	# dead watcher must still let the badge lapse). The fast path is an explicit
+	# diff: any Space that lost its last listener since the previous poll gets a
+	# --clear-token immediately, so a server killed outside the popup drops its
+	# badge within one INTERVAL instead of waiting out the ~15s TTL.
 	# seq is epoch-based: the server keeps the last seq per source across
 	# watcher restarts and silently drops posts that do not exceed it, so a
 	# counter restarting at 1 would never show again.
-	local ttl=$(((INTERVAL + 10) * 1000)) ws
+	local ttl=$(((INTERVAL + 10) * 1000)) ws now cur prev=''
 	while :; do
-		for ws in $(pid_ports | pid_cwds | match_join <(workspace_cwds) | cut -f3 | sort -u); do
+		cur=$(active_workspaces)
+		now=$(date +%s)
+		for ws in $cur; do
 			"$HERDR" workspace report-metadata "$ws" --source ports \
-				--token ports="$BADGE" --ttl-ms "$ttl" --seq "$(date +%s)" > /dev/null 2>&1
+				--token ports="$BADGE" --ttl-ms "$ttl" --seq "$now" > /dev/null 2>&1
 		done
+		# comm needs sorted input; active_workspaces already sorts -u, and prev
+		# is a prior cur, so both sides are sorted
+		for ws in $(comm -23 <(printf '%s\n' "$prev") <(printf '%s\n' "$cur")); do
+			[ -n "$ws" ] && "$HERDR" workspace report-metadata "$ws" \
+				--source ports --clear-token ports --seq "$now" > /dev/null 2>&1
+		done
+		prev=$cur
 		sleep "$INTERVAL"
 	done
 }
@@ -236,24 +255,47 @@ cursor_down() {
 	return 0
 }
 
-# TERM the checked rows (or the highlighted one when none checked), KILL
-# survivors after 2s. Outcome goes to $status, rendered in the footer bar.
+# TERM the checked rows (or the highlighted one when none checked). Instead of
+# the old blocking 2s wait, poll fast (dev servers exit on TERM in a few ms) so
+# the popup redraws immediately, escalate any straggler to KILL in a detached
+# child, and clear the sidebar badge for Spaces that just lost their last
+# listener rather than waiting out the metadata TTL. Outcome -> $status (footer).
 kill_targets() {
-	local targets='' i pid killed='' forced=''
+	local targets='' i pid killed='' remaining='' before after ws
 	for ((i = 1; i <= n; i++)); do
 		[ "${checked[i]}" = 1 ] && targets="$targets ${pids[i]}"
 	done
 	[ -z "$targets" ] && [ "$n" -gt 0 ] && targets="${pids[cur]}"
 	[ -n "$targets" ] || return 0
+	before=$(active_workspaces)
 	for pid in $targets; do
 		kill "$pid" 2> /dev/null && killed="$killed $pid"
 	done
-	sleep 2
-	for pid in $targets; do
-		kill -0 "$pid" 2> /dev/null && kill -9 "$pid" 2> /dev/null && forced="$forced $pid"
+	# ~1s budget, but breaks the instant the last target is reaped (the common
+	# case) so the redraw is not held hostage to the slowest server
+	for ((i = 0; i < 20; i++)); do
+		remaining=''
+		for pid in $targets; do
+			kill -0 "$pid" 2> /dev/null && remaining="$remaining $pid"
+		done
+		[ -z "$remaining" ] && break
+		sleep 0.05
+	done
+	# stragglers get SIGKILL off the UI thread - never block the popup
+	[ -n "$remaining" ] && (
+		sleep 1
+		for pid in $remaining; do kill -9 "$pid" 2> /dev/null; done
+	) &
+	# clear the $ports badge for Spaces whose last listener just died; seq must
+	# exceed the watcher's last post (epoch seconds - our "now" wins unless the
+	# watcher posted this exact second, in which case the TTL is the backstop)
+	after=$(active_workspaces)
+	for ws in $(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after")); do
+		[ -n "$ws" ] && "$HERDR" workspace report-metadata "$ws" \
+			--source ports --clear-token ports --seq "$(date +%s)" > /dev/null 2>&1
 	done
 	status="TERM →$killed"
-	[ -n "$forced" ] && status="$status · KILL →$forced"
+	[ -n "$remaining" ] && status="$status · KILL →$remaining"
 	needs_refresh=1
 }
 

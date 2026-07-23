@@ -57,7 +57,9 @@ your theme's accent. Hints and chips are all clickable. Mouse: click a row to
 check it, use the wheel to move. Keyboard:
 
 - arrows / `j` `k`: move - `space`: check - `enter`: kill checked rows (or the
-  highlighted one when none checked); TERM first, KILL after 2s
+  highlighted one when none checked); TERM, then the list redraws the instant
+  the targets exit (stragglers get KILL in the background), and the Space's
+  `$ports` badge clears right away instead of waiting out the metadata TTL
 - `a`: include listeners outside herdr workspaces - `r`: refresh - `esc` / `q`: quit
 
 ## How the badge works
