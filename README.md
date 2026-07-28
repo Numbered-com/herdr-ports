@@ -5,14 +5,21 @@ badge on every Space running at least one TCP listener, and a popup to inspect
 and kill them. Working on several projects at once, it answers "which space
 has a live server?" at a glance.
 
-Ports are attributed to a Space by matching the listener's process cwd against
-the cwds of the workspace's panes - servers started outside herdr still show
-up as long as they run inside a workspace directory. System daemons (cwd `/`,
-`~/Library`, ...) never match, so the default view stays clean. Exactly one
-Space wins each listener: candidates are ranked exact cwd match, then listener
-under a pane cwd, then the reverse, ties broken by the deepest pane cwd. So a
-Space parked at `$HOME` only claims a server when no more specific Space
-matched, instead of claiming everything on the machine.
+Ports are attributed to a Space by **process ancestry** first: a listener whose
+parent chain reaches a pane's shell (`herdr pane process-info` → `shell_pid`)
+belongs to that pane's Space, full stop. This is what lets you run the same app
+in several Spaces at once - three copies of one server started from the same
+worktree directory land in three different Spaces, because their shells differ
+even though their cwds are identical.
+
+Listeners with no pane ancestor - system daemons, docker, anything started
+outside herdr - fall back to matching the process cwd against the cwds of the
+workspace's panes, which is what that heuristic is genuinely good at. System
+daemons (cwd `/`, `~/Library`, ...) never match, so the default view stays
+clean. On the fallback path exactly one Space still wins: candidates are ranked
+exact cwd match, then listener under a pane cwd, then the reverse, ties broken
+by the deepest pane cwd, so a Space parked at `$HOME` only claims a server when
+nothing more specific matched.
 
 ## Install
 

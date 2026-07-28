@@ -159,11 +159,73 @@ match_join() {
 	' "$1" - | sort -u
 }
 
+# "shell_pid<TAB>workspace_id" for every pane with a live shell. One API call
+# per pane, so this is the expensive part of a poll - but pane shells only
+# change when panes open or close, and the payload is tiny.
+pane_shells() {
+	local pane ws sp
+	"$HERDR" pane list 2> /dev/null | jq -r '
+		.result.panes[]? | [.pane_id, .workspace_id] | @tsv
+	' 2> /dev/null | while IFS=$'\t' read -r pane ws; do
+		[ -n "$pane" ] || continue
+		sp=$("$HERDR" pane process-info --pane "$pane" 2> /dev/null \
+			| jq -r '.result.process_info.shell_pid // empty' 2> /dev/null)
+		[ -n "$sp" ] && printf '%s\t%s\n' "$sp" "$ws"
+	done
+}
+
+# $1: pane_shells file; $2: "pid<TAB>ppid" map; stdin: pids -> "pid<TAB>ws_id"
+# for listeners whose parent chain reaches a pane shell. The depth cap is a
+# cycle guard: a corrupt ppid map must not spin forever.
+ancestry_join() {
+	awk -F'\t' '
+		FILENAME == ARGV[1] { ws[$1] = $2; next }
+		FILENAME == ARGV[2] { ppid[$1] = $2; next }
+		{
+			p = $1
+			for (i = 0; i < 64; i++) {
+				if (p == "" || p == "0" || p == "1") break
+				if (p in ws) { print $1 "\t" ws[p]; break }
+				p = (p in ppid) ? ppid[p] : ""
+			}
+		}
+	' "$1" "$2" -
+}
+
+# $1: scratch dir; $2: pid_ports file -> "pid<TAB>workspace_id", sorted -u.
+#
+# Ancestry is authoritative. A server launched in a pane traces through its
+# parent chain to that pane's shell, which separates two instances of the same
+# app started from the same directory in different Spaces - something cwd
+# matching cannot do even in principle, because their cwds are identical.
+# Listeners with no pane ancestor (system daemons, docker, anything started
+# outside herdr) fall back to cwd matching, which is what it is actually good
+# at: attributing servers herdr never launched.
+pid_workspaces() {
+	local tmp="$1" ports="$2"
+	pane_shells > "$tmp/shells"
+	# ps is the portable pid->ppid dump: /proc is Linux-only and this plugin
+	# also runs on macOS
+	ps -eo pid=,ppid= 2> /dev/null | awk 'NF >= 2 { print $1 "\t" $2 }' > "$tmp/ppidmap"
+	cut -f1 "$ports" | sort -un > "$tmp/allpids"
+	ancestry_join "$tmp/shells" "$tmp/ppidmap" < "$tmp/allpids" > "$tmp/byanc"
+	pid_cwds < "$ports" | match_join <(workspace_cwds) | cut -f1,3 > "$tmp/bycwd"
+	# ancestry lines pass through; cwd only fills pids ancestry did not claim
+	awk -F'\t' '
+		FILENAME == ARGV[1] { anc[$1] = 1; print; next }
+		!($1 in anc) { print }
+	' "$tmp/byanc" "$tmp/bycwd" | sort -u
+}
+
 # workspace_ids (one per line, sorted -u) running >=1 attributed TCP listener.
 # Shared by the watcher (post the badge) and the kill path (diff before/after
 # to clear the badge for Spaces that just lost their last server).
 active_workspaces() {
-	pid_ports | pid_cwds | match_join <(workspace_cwds) | cut -f3 | sort -u
+	local t
+	t=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports-aw.XXXXXX") || return 0
+	pid_ports > "$t/pp"
+	pid_workspaces "$t" "$t/pp" | cut -f2 | sort -u
+	rm -rf "$t"
 }
 
 # "workspace_id<TAB>text" - one line per (Space, listening port), sorted by
@@ -174,8 +236,7 @@ workspace_port_rows() {
 	local tmp="$1" pidlist
 	pid_ports > "$tmp/pp"
 	[ -s "$tmp/pp" ] || return 0
-	pid_cwds < "$tmp/pp" > "$tmp/cwds"
-	match_join <(workspace_cwds) < "$tmp/cwds" | cut -f1,3 | sort -u > "$tmp/pidws"
+	pid_workspaces "$tmp" "$tmp/pp" > "$tmp/pidws"
 	[ -s "$tmp/pidws" ] || return 0
 	# one ps for every listener rather than one per pid: this runs every
 	# $INTERVAL seconds, unlike build_rows which runs once per popup redraw.
@@ -291,9 +352,8 @@ build_rows() {
 	local tmp="$1" space pid ports cwd cmd
 	pid_ports > "$tmp/ports"
 	pid_cwds < "$tmp/ports" > "$tmp/cwds"
-	workspace_cwds > "$tmp/ws"
 	workspace_labels > "$tmp/labels"
-	match_join "$tmp/ws" < "$tmp/cwds" | cut -f1,3 | sort -u > "$tmp/pidws"
+	pid_workspaces "$tmp" "$tmp/ports" > "$tmp/pidws"
 	awk -F'\t' '
 		FILENAME == ARGV[1] { lbl[$1] = $2; next }
 		FILENAME == ARGV[2] { if (!($1 in ws)) ws[$1] = ($2 in lbl ? lbl[$2] : $2); next }
