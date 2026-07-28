@@ -119,16 +119,30 @@ workspace_labels() {
 # versa (server launched at the repo root while panes sit in subdirs). $HOME
 # is excluded from the reverse match: launchd/user daemons living there would
 # claim every workspace under it.
+#
+# Exactly one Space wins. Matching every candidate meant a Space with a pane
+# parked at $HOME forward-matched every listener under it and claimed the whole
+# machine - invisible behind a boolean badge, but it also duplicated a server
+# across Spaces in the popup's SPACE column. Candidates are ranked exact (3) >
+# forward, listener under pane cwd (2) > reverse (1), ties broken by the
+# longest pane cwd, so the deepest enclosing Space owns the port and a $HOME
+# pane only wins when nothing more specific matched.
 match_join() {
 	awk -F'\t' -v home="$HOME" '
 		NR == FNR { wsid[NR] = $1; wcwd[NR] = $2; n = NR; next }
 		{
+			rank = 0; len = 0; best = ""
 			for (i = 1; i <= n; i++) {
 				w = wcwd[i]
-				if ($2 == w || index($2, w "/") == 1 || ($2 != home && index(w, $2 "/") == 1)) {
-					print $1 "\t" $2 "\t" wsid[i]
+				if ($2 == w) r = 3
+				else if (index($2, w "/") == 1) r = 2
+				else if ($2 != home && index(w, $2 "/") == 1) r = 1
+				else continue
+				if (r > rank || (r == rank && length(w) > len)) {
+					rank = r; len = length(w); best = wsid[i]
 				}
 			}
+			if (best != "") print $1 "\t" $2 "\t" best
 		}
 	' "$1" - | sort -u
 }

@@ -8,7 +8,11 @@ has a live server?" at a glance.
 Ports are attributed to a Space by matching the listener's process cwd against
 the cwds of the workspace's panes - servers started outside herdr still show
 up as long as they run inside a workspace directory. System daemons (cwd `/`,
-`~/Library`, ...) never match, so the default view stays clean.
+`~/Library`, ...) never match, so the default view stays clean. Exactly one
+Space wins each listener: candidates are ranked exact cwd match, then listener
+under a pane cwd, then the reverse, ties broken by the deepest pane cwd. So a
+Space parked at `$HOME` only claims a server when no more specific Space
+matched, instead of claiming everything on the machine.
 
 ## Install
 
