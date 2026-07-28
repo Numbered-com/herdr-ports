@@ -43,6 +43,31 @@ command = "numbered.ports.open"
 
 Then `herdr server reload-config`.
 
+### A row per port
+
+The watcher also posts one `$portN` token per listening port (`:3000 next-server`),
+so the Space can list its servers instead of just flagging them:
+
+```toml
+[ui.sidebar.spaces]
+rows = [
+  ["state_icon", "workspace"],
+  ["branch", "git_status"],
+  ["$port1"], ["$port2"], ["$port3"], ["$port4"], ["$port5"],
+]
+```
+
+herdr drops any row whose tokens all resolve to nothing and sizes the Space
+card from the surviving rows, so the card grows and shrinks with the live port
+count - a Space with one server shows one row, a Space with none shows none.
+
+The **maximum** is not dynamic: herdr resolves a fixed list of row templates,
+so a Space can never render more rows than you declare here. `HERDR_PORTS_ROWS`
+(default 5) tells the watcher how many slots to fill and must match the number
+of `$portN` rows above; a Space with more listeners than that shows the
+lowest-numbered ports and drops the rest. Keep it at 15 or below - a metadata
+report may carry at most 16 tokens and `$ports` uses one.
+
 ## Popup
 
 ```
