@@ -4,15 +4,19 @@
 #   herdr-ports               interactive popup: checkbox list of servers, kill them
 #   herdr-ports list          print the table once and exit (scripting/debug)
 #   herdr-ports watch         poller: tag Spaces running >=1 TCP listener with a
-#                             generic $ports badge (workspace metadata, TTL-cleared)
+#                             generic $ports badge plus one $portN token per
+#                             listening port (workspace metadata, TTL-cleared)
 #   herdr-ports ensure-watch  start the watcher if it is not already running
 #                             (invoked by the pane.created plugin event)
 #
 # Ships as a herdr plugin: the popup pane and the watcher autostart are wired
 # by herdr-plugin.toml. Two lines stay in the user's config.toml because
-# plugins cannot inject them (see README):
+# plugins cannot inject them (see README) - either the compact badge:
 #   [ui.sidebar.spaces]
 #   rows = [["state_icon", "workspace", "$ports"], ["branch", "git_status"]]
+# or a row per port, which herdr collapses to the live count:
+#   rows = [["state_icon", "workspace"], ["branch", "git_status"],
+#           ["$port1"], ["$port2"], ["$port3"], ["$port4"], ["$port5"]]
 #
 #   [[keys.command]]
 #   key = "prefix+a"
@@ -35,6 +39,14 @@ HERDR="${HERDR_BIN_PATH:-herdr}"
 # Private Use Area characters from metadata tokens.
 BADGE="${HERDR_PORTS_BADGE:-↯}"
 INTERVAL="${HERDR_PORTS_INTERVAL:-5}"
+# Number of per-port sidebar rows ($port1..$portN) the watcher maintains. The
+# ceiling has to live here as well as in config.toml: herdr resolves a fixed
+# list of row templates, so a Space can never render more rows than the user
+# declared. Slots past a Space's listener count are cleared, and herdr drops
+# rows whose tokens all resolve to nothing - so the rendered count is dynamic
+# even though the maximum is not. Keep this <= 15: a metadata report may carry
+# at most 16 tokens, and the generic $ports badge takes one of them.
+ROWS="${HERDR_PORTS_ROWS:-5}"
 # 256-color index for the primary CTA chip, mimicking herdr's native accent
 # buttons (223 ~ vesper's peach). Panes render with the terminal palette, not
 # herdr's theme, so the exact accent cannot be queried - override to match.
@@ -119,25 +131,139 @@ workspace_labels() {
 # versa (server launched at the repo root while panes sit in subdirs). $HOME
 # is excluded from the reverse match: launchd/user daemons living there would
 # claim every workspace under it.
+#
+# Exactly one Space wins. Matching every candidate meant a Space with a pane
+# parked at $HOME forward-matched every listener under it and claimed the whole
+# machine - invisible behind a boolean badge, but it also duplicated a server
+# across Spaces in the popup's SPACE column. Candidates are ranked exact (3) >
+# forward, listener under pane cwd (2) > reverse (1), ties broken by the
+# longest pane cwd, so the deepest enclosing Space owns the port and a $HOME
+# pane only wins when nothing more specific matched.
 match_join() {
 	awk -F'\t' -v home="$HOME" '
 		NR == FNR { wsid[NR] = $1; wcwd[NR] = $2; n = NR; next }
 		{
+			rank = 0; len = 0; best = ""
 			for (i = 1; i <= n; i++) {
 				w = wcwd[i]
-				if ($2 == w || index($2, w "/") == 1 || ($2 != home && index(w, $2 "/") == 1)) {
-					print $1 "\t" $2 "\t" wsid[i]
+				if ($2 == w) r = 3
+				else if (index($2, w "/") == 1) r = 2
+				else if ($2 != home && index(w, $2 "/") == 1) r = 1
+				else continue
+				if (r > rank || (r == rank && length(w) > len)) {
+					rank = r; len = length(w); best = wsid[i]
 				}
 			}
+			if (best != "") print $1 "\t" $2 "\t" best
 		}
 	' "$1" - | sort -u
+}
+
+# "shell_pid<TAB>workspace_id" for every pane with a live shell. One API call
+# per pane, so this is the expensive part of a poll - but pane shells only
+# change when panes open or close, and the payload is tiny.
+pane_shells() {
+	local pane ws sp
+	"$HERDR" pane list 2> /dev/null | jq -r '
+		.result.panes[]? | [.pane_id, .workspace_id] | @tsv
+	' 2> /dev/null | while IFS=$'\t' read -r pane ws; do
+		[ -n "$pane" ] || continue
+		sp=$("$HERDR" pane process-info --pane "$pane" 2> /dev/null \
+			| jq -r '.result.process_info.shell_pid // empty' 2> /dev/null)
+		[ -n "$sp" ] && printf '%s\t%s\n' "$sp" "$ws"
+	done
+}
+
+# $1: pane_shells file; $2: "pid<TAB>ppid" map; stdin: pids -> "pid<TAB>ws_id"
+# for listeners whose parent chain reaches a pane shell. The depth cap is a
+# cycle guard: a corrupt ppid map must not spin forever.
+ancestry_join() {
+	awk -F'\t' '
+		FILENAME == ARGV[1] { ws[$1] = $2; next }
+		FILENAME == ARGV[2] { ppid[$1] = $2; next }
+		{
+			p = $1
+			for (i = 0; i < 64; i++) {
+				if (p == "" || p == "0" || p == "1") break
+				if (p in ws) { print $1 "\t" ws[p]; break }
+				p = (p in ppid) ? ppid[p] : ""
+			}
+		}
+	' "$1" "$2" -
+}
+
+# $1: scratch dir; $2: pid_ports file -> "pid<TAB>workspace_id", sorted -u.
+#
+# Ancestry is authoritative. A server launched in a pane traces through its
+# parent chain to that pane's shell, which separates two instances of the same
+# app started from the same directory in different Spaces - something cwd
+# matching cannot do even in principle, because their cwds are identical.
+# Listeners with no pane ancestor (system daemons, docker, anything started
+# outside herdr) fall back to cwd matching, which is what it is actually good
+# at: attributing servers herdr never launched.
+pid_workspaces() {
+	local tmp="$1" ports="$2"
+	pane_shells > "$tmp/shells"
+	# ps is the portable pid->ppid dump: /proc is Linux-only and this plugin
+	# also runs on macOS
+	ps -eo pid=,ppid= 2> /dev/null | awk 'NF >= 2 { print $1 "\t" $2 }' > "$tmp/ppidmap"
+	cut -f1 "$ports" | sort -un > "$tmp/allpids"
+	ancestry_join "$tmp/shells" "$tmp/ppidmap" < "$tmp/allpids" > "$tmp/byanc"
+	pid_cwds < "$ports" | match_join <(workspace_cwds) | cut -f1,3 > "$tmp/bycwd"
+	# ancestry lines pass through; cwd only fills pids ancestry did not claim
+	awk -F'\t' '
+		FILENAME == ARGV[1] { anc[$1] = 1; print; next }
+		!($1 in anc) { print }
+	' "$tmp/byanc" "$tmp/bycwd" | sort -u
 }
 
 # workspace_ids (one per line, sorted -u) running >=1 attributed TCP listener.
 # Shared by the watcher (post the badge) and the kill path (diff before/after
 # to clear the badge for Spaces that just lost their last server).
 active_workspaces() {
-	pid_ports | pid_cwds | match_join <(workspace_cwds) | cut -f3 | sort -u
+	local t
+	t=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports-aw.XXXXXX") || return 0
+	pid_ports > "$t/pp"
+	pid_workspaces "$t" "$t/pp" | cut -f2 | sort -u
+	rm -rf "$t"
+}
+
+# "workspace_id<TAB>text" - one line per (Space, listening port), sorted by
+# workspace then numeric port, text like ":3000 next-server". At most $ROWS
+# lines per workspace. Needs a scratch dir ($1) because the pid->workspace and
+# pid->port joins are read twice and bash 3.2 has no associative arrays.
+workspace_port_rows() {
+	local tmp="$1" pidlist
+	pid_ports > "$tmp/pp"
+	[ -s "$tmp/pp" ] || return 0
+	pid_workspaces "$tmp" "$tmp/pp" > "$tmp/pidws"
+	[ -s "$tmp/pidws" ] || return 0
+	# one ps for every listener rather than one per pid: this runs every
+	# $INTERVAL seconds, unlike build_rows which runs once per popup redraw.
+	# comm is the bare executable name (bun, java, next-server) - args would
+	# blow past the sidebar width and the 80-char metadata value cap anyway.
+	pidlist=$(cut -f1 "$tmp/pp" | sort -un | paste -s -d, -)
+	ps -o pid=,comm= -p "$pidlist" 2> /dev/null | awk '
+		{ pid = $1; $1 = ""; sub(/^ +/, ""); sub(/.*\//, ""); print pid "\t" $0 }
+	' > "$tmp/comm"
+	# %05d port key so the lexicographic sort below orders numerically; a
+	# listener bound on both v4 and v6 collapses via the (ws, port) -u keys
+	awk -F'\t' '
+		FILENAME == ARGV[1] { n++; wpid[n] = $1; wws[n] = $2; next }
+		FILENAME == ARGV[2] { cmd[$1] = $2; next }
+		{
+			for (i = 1; i <= n; i++) {
+				if (wpid[i] != $1) continue
+				printf "%s\t%05d\t:%s%s\n", wws[i], $2, $2, \
+					($1 in cmd && cmd[$1] != "" ? " " cmd[$1] : "")
+			}
+		}
+	' "$tmp/pidws" "$tmp/comm" "$tmp/pp" \
+		| LC_ALL=C sort -u -t "$(printf '\t')" -k1,1 -k2,2 \
+		| awk -F'\t' -v rows="$ROWS" '
+			$1 != last { last = $1; c = 0 }
+			{ if (++c <= rows) print $1 "\t" $3 }
+		'
 }
 
 pidfile_path() {
@@ -150,10 +276,20 @@ watcher_alive() {
 	[ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2> /dev/null)" 2> /dev/null
 }
 
+# Every token this plugin owns, cleared in one report: the generic badge plus
+# every per-port row slot. Used for Spaces that just lost their last listener.
+clear_args() {
+	local i
+	printf '%s\n' --clear-token ports
+	for ((i = 1; i <= ROWS; i++)); do printf '%s\n' --clear-token "port$i"; done
+}
+
 watch_loop() {
 	watcher_alive && exit 0
 	echo $$ > "$(pidfile_path)"
-	trap 'rm -f "$(pidfile_path)"' EXIT
+	# not local: the EXIT trap fires after this returned, under set -u
+	wtmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports-watch.XXXXXX")
+	trap 'rm -f "$(pidfile_path)"; rm -rf "$wtmp"' EXIT
 
 	# The TTL is only a backstop (a missed poll must not flicker the badge, and a
 	# dead watcher must still let the badge lapse). The fast path is an explicit
@@ -163,19 +299,37 @@ watch_loop() {
 	# seq is epoch-based: the server keeps the last seq per source across
 	# watcher restarts and silently drops posts that do not exceed it, so a
 	# counter restarting at 1 would never show again.
-	local ttl=$(((INTERVAL + 10) * 1000)) ws now cur prev=''
+	local ttl=$(((INTERVAL + 10) * 1000)) ws now cur prev='' text i w a
+	local -a args
 	while :; do
-		cur=$(active_workspaces)
+		: > "$wtmp/rows"
+		workspace_port_rows "$wtmp" > "$wtmp/rows"
+		cur=$(cut -f1 "$wtmp/rows" | sort -u)
 		now=$(date +%s)
 		for ws in $cur; do
-			"$HERDR" workspace report-metadata "$ws" --source ports \
-				--token ports="$BADGE" --ttl-ms "$ttl" --seq "$now" > /dev/null 2>&1
+			# $ports stays for the compact single-glyph badge; $port1..$portN
+			# carry the rows. Both go in one report so a Space never renders a
+			# half-updated mix, and slots past this Space's listener count are
+			# cleared in the same call - herdr then drops those rows entirely.
+			args=(--source ports --ttl-ms "$ttl" --seq "$now" --token "ports=$BADGE")
+			i=0
+			while IFS=$'\t' read -r w text; do
+				[ "$w" = "$ws" ] || continue
+				i=$((i + 1))
+				args+=(--token "port$i=$text")
+			done < "$wtmp/rows"
+			while [ "$i" -lt "$ROWS" ]; do
+				i=$((i + 1))
+				args+=(--clear-token "port$i")
+			done
+			"$HERDR" workspace report-metadata "$ws" "${args[@]}" > /dev/null 2>&1
 		done
-		# comm needs sorted input; active_workspaces already sorts -u, and prev
-		# is a prior cur, so both sides are sorted
+		# comm needs sorted input; cur is sorted -u above, and prev is a prior cur
 		for ws in $(comm -23 <(printf '%s\n' "$prev") <(printf '%s\n' "$cur")); do
-			[ -n "$ws" ] && "$HERDR" workspace report-metadata "$ws" \
-				--source ports --clear-token ports --seq "$now" > /dev/null 2>&1
+			[ -n "$ws" ] || continue
+			args=(--source ports --seq "$now")
+			while IFS= read -r a; do args+=("$a"); done < <(clear_args)
+			"$HERDR" workspace report-metadata "$ws" "${args[@]}" > /dev/null 2>&1
 		done
 		prev=$cur
 		sleep "$INTERVAL"
@@ -198,9 +352,8 @@ build_rows() {
 	local tmp="$1" space pid ports cwd cmd
 	pid_ports > "$tmp/ports"
 	pid_cwds < "$tmp/ports" > "$tmp/cwds"
-	workspace_cwds > "$tmp/ws"
 	workspace_labels > "$tmp/labels"
-	match_join "$tmp/ws" < "$tmp/cwds" | cut -f1,3 | sort -u > "$tmp/pidws"
+	pid_workspaces "$tmp" "$tmp/ports" > "$tmp/pidws"
 	awk -F'\t' '
 		FILENAME == ARGV[1] { lbl[$1] = $2; next }
 		FILENAME == ARGV[2] { if (!($1 in ws)) ws[$1] = ($2 in lbl ? lbl[$2] : $2); next }
@@ -261,7 +414,7 @@ cursor_down() {
 # child, and clear the sidebar badge for Spaces that just lost their last
 # listener rather than waiting out the metadata TTL. Outcome -> $status (footer).
 kill_targets() {
-	local targets='' i pid killed='' remaining='' before after ws
+	local targets='' i pid killed='' remaining='' before after ws a
 	for ((i = 1; i <= n; i++)); do
 		[ "${checked[i]}" = 1 ] && targets="$targets ${pids[i]}"
 	done
@@ -290,9 +443,12 @@ kill_targets() {
 	# exceed the watcher's last post (epoch seconds - our "now" wins unless the
 	# watcher posted this exact second, in which case the TTL is the backstop)
 	after=$(active_workspaces)
+	local -a cargs
 	for ws in $(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after")); do
-		[ -n "$ws" ] && "$HERDR" workspace report-metadata "$ws" \
-			--source ports --clear-token ports --seq "$(date +%s)" > /dev/null 2>&1
+		[ -n "$ws" ] || continue
+		cargs=(--source ports --seq "$(date +%s)")
+		while IFS= read -r a; do cargs+=("$a"); done < <(clear_args)
+		"$HERDR" workspace report-metadata "$ws" "${cargs[@]}" > /dev/null 2>&1
 	done
 	status="TERM →$killed"
 	[ -n "$remaining" ] && status="$status · KILL →$remaining"

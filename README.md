@@ -5,10 +5,21 @@ badge on every Space running at least one TCP listener, and a popup to inspect
 and kill them. Working on several projects at once, it answers "which space
 has a live server?" at a glance.
 
-Ports are attributed to a Space by matching the listener's process cwd against
-the cwds of the workspace's panes - servers started outside herdr still show
-up as long as they run inside a workspace directory. System daemons (cwd `/`,
-`~/Library`, ...) never match, so the default view stays clean.
+Ports are attributed to a Space by **process ancestry** first: a listener whose
+parent chain reaches a pane's shell (`herdr pane process-info` → `shell_pid`)
+belongs to that pane's Space, full stop. This is what lets you run the same app
+in several Spaces at once - three copies of one server started from the same
+worktree directory land in three different Spaces, because their shells differ
+even though their cwds are identical.
+
+Listeners with no pane ancestor - system daemons, docker, anything started
+outside herdr - fall back to matching the process cwd against the cwds of the
+workspace's panes, which is what that heuristic is genuinely good at. System
+daemons (cwd `/`, `~/Library`, ...) never match, so the default view stays
+clean. On the fallback path exactly one Space still wins: candidates are ranked
+exact cwd match, then listener under a pane cwd, then the reverse, ties broken
+by the deepest pane cwd, so a Space parked at `$HOME` only claims a server when
+nothing more specific matched.
 
 ## Install
 
@@ -38,6 +49,31 @@ command = "numbered.ports.open"
 ```
 
 Then `herdr server reload-config`.
+
+### A row per port
+
+The watcher also posts one `$portN` token per listening port (`:3000 next-server`),
+so the Space can list its servers instead of just flagging them:
+
+```toml
+[ui.sidebar.spaces]
+rows = [
+  ["state_icon", "workspace"],
+  ["branch", "git_status"],
+  ["$port1"], ["$port2"], ["$port3"], ["$port4"], ["$port5"],
+]
+```
+
+herdr drops any row whose tokens all resolve to nothing and sizes the Space
+card from the surviving rows, so the card grows and shrinks with the live port
+count - a Space with one server shows one row, a Space with none shows none.
+
+The **maximum** is not dynamic: herdr resolves a fixed list of row templates,
+so a Space can never render more rows than you declare here. `HERDR_PORTS_ROWS`
+(default 5) tells the watcher how many slots to fill and must match the number
+of `$portN` rows above; a Space with more listeners than that shows the
+lowest-numbered ports and drops the rest. Keep it at 15 or below - a metadata
+report may carry at most 16 tokens and `$ports` uses one.
 
 ## Popup
 
