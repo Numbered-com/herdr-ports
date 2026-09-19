@@ -74,6 +74,10 @@ watcher is a singleton started by a `pane.created` event hook, no daemon setup
 needed. Nerd Font glyphs cannot be used as badge: herdr strips Private Use Area
 characters from metadata tokens.
 
+The watcher reloads itself after script updates. The popup rechecks workspace
+and process directories on every refresh, even when the sockets are unchanged.
+All TCP listeners qualify, not only development servers.
+
 ## CLI
 
 ```sh

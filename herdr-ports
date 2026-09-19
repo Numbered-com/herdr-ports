@@ -161,9 +161,9 @@ watcher_alive() {
 }
 
 watch_loop() {
-	watcher_alive && exit 0
+	watcher_alive && [ "$(cat "$(pidfile_path)")" != "$$" ] && exit 0
 	echo $$ > "$(pidfile_path)"
-	trap 'rm -f "$(pidfile_path)"' EXIT
+	trap '[ "$(cat "$(pidfile_path)" 2>/dev/null)" != "$$" ] || rm -f "$(pidfile_path)"' EXIT
 
 	# The TTL is only a backstop (a missed poll must not flicker the badge, and a
 	# dead watcher must still let the badge lapse). The fast path is an explicit
@@ -173,8 +173,11 @@ watch_loop() {
 	# seq is epoch-based: the server keeps the last seq per source across
 	# watcher restarts and silently drops posts that do not exceed it, so a
 	# counter restarting at 1 would never show again.
-	local ttl=$(((INTERVAL + 10) * 1000)) ws now cur prev=''
+	local ttl=$(((INTERVAL + 10) * 1000)) ws now cur prev="${HERDR_PORTS_PREV:-}"
+	local revision
+	revision=$(cksum < "$0")
 	while :; do
+		[ "$(cat "$(pidfile_path)" 2>/dev/null)" = "$$" ] || exit 0
 		cur=$(active_workspaces)
 		now=$(date +%s)
 		for ws in $cur; do
@@ -189,6 +192,11 @@ watch_loop() {
 		done
 		prev=$cur
 		sleep "$INTERVAL"
+		# Reload updated detection code without losing the badge-clear diff.
+		if [ "$(cksum < "$0")" != "$revision" ]; then
+			export HERDR_PORTS_PREV="$prev"
+			exec bash "$0" watch
+		fi
 	done
 }
 
@@ -229,17 +237,9 @@ build_rows() {
 	workspace_labels > "$tmp/labels" &
 	j2=$!
 	pid_ports > "$tmp/ports"
-	# cwd lookups (lsof, the slowest stage) are cached per pid for the life of
-	# the popup: only pids never seen before are resolved, so a refresh with
-	# an unchanged listener set skips lsof entirely. "seen" also remembers
-	# pids without a usable cwd; vanished pids are pruned against reuse.
-	cut -f1 "$tmp/ports" | sort -u > "$tmp/pids.now"
-	touch "$tmp/seen" "$tmp/cwdcache"
-	comm -13 "$tmp/seen" "$tmp/pids.now" > "$tmp/pids.new"
-	[ -s "$tmp/pids.new" ] && pid_cwds < "$tmp/pids.new" >> "$tmp/cwdcache"
-	awk -F'\t' 'FILENAME == ARGV[1] { k[$1]; next } $1 in k' "$tmp/pids.now" "$tmp/cwdcache" > "$tmp/cwds"
-	cp "$tmp/cwds" "$tmp/cwdcache"
-	cp "$tmp/pids.now" "$tmp/seen"
+	# Resolve fresh cwds just like the watcher: processes can chdir without
+	# changing their PID or listening sockets, and failed lookups can recover.
+	pid_cwds < "$tmp/ports" > "$tmp/cwds"
 	wait "$j1" "$j2"
 	match_join "$tmp/ws" < "$tmp/cwds" | cut -f1,3 | sort -u > "$tmp/pidws"
 	awk -F'\t' '
@@ -269,12 +269,6 @@ build_rows() {
 		}
 		{ print $1, $2, $3, $4, ($2 in m ? m[$2] : "-"), ($2 in c ? c[$2] : "-"), ($2 in k ? k[$2] : 0), ($2 in a ? a[$2] : "?") }
 	' "$tmp/ps" "$tmp/base"
-}
-
-# "pid mem cpu rss" for the pids in $1 - the cheap path of the popup timer (no
-# socket/cwd/workspace lookups)
-pid_metrics() {
-	ps_each "$1" -o pid= -o rss= -o %cpu= | awk "$AWK_MEM"'{ print $1, mem($2), $3, $2 }'
 }
 
 shorten() {
@@ -452,7 +446,7 @@ read_esc_tail() {
 
 popup() {
 	local show_all=0 n=0 cur=1 top=0 msp=0 mpo=0 mpa=0 mpr=0 needs_refresh=1 needs_view=0 booting=1 i key seq prev status=''
-	local tick=0 resized=1 lastports='' list y t0 rc dsr_ok=1 wacc=0
+	local tick=0 resized=1 y t0 rc dsr_ok=1 wacc=0
 	local space pid ports cwd mem cpu rss cmd tmem='' tcpu='' mbuf body mb mx my bt3 k ev term rows=24 cols=80
 	# not local: the EXIT trap fires after popup() returned, under set -u
 	tmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports.XXXXXX")
@@ -470,22 +464,11 @@ popup() {
 	printf '\033[?25l\033[?1000h\033[?1006h'
 
 	while :; do
-		# Timer tick, cheap path: one netstat to see whether the listener set
-		# moved; if not, a single ps refreshes MEM/CPU% in place. The full
-		# rebuild (cwds, herdr snapshot, labels) only runs when it did.
+		# Attribution can change even when the listening sockets do not.
+		# Refresh the same inputs as the badge watcher on every timer tick.
 		if [ "$tick" = 1 ]; then
 			tick=0
-			if [ "$(pid_ports)" != "$lastports" ]; then
-				needs_refresh=1
-			elif [ "$n" -gt 0 ]; then
-				list=${pids[*]}
-				while read -r pid mem cpu rss; do
-					for ((i = 1; i <= n; i++)); do
-						[ "${pids[i]}" = "$pid" ] && mems[i]=$mem cpus[i]=$cpu rsss[i]=$rss && break
-					done
-				done < <(pid_metrics "$list")
-				sum_totals
-			fi
+			needs_refresh=1
 		fi
 		# needs_refresh rebuilds the rows (slow: sockets, cwds, herdr snapshot);
 		# needs_view only re-filters the rows already on disk, fork-free, so
@@ -494,7 +477,6 @@ popup() {
 		# opens onto an empty pane
 		if [ "$needs_refresh" = 1 ] && [ "$booting" = 0 ]; then
 			build_rows "$tmp" > "$tmp/rows"
-			lastports=$(< "$tmp/ports")
 			needs_view=1
 		fi
 		if [ "$needs_view" = 1 ] && [ "$booting" = 0 ]; then
