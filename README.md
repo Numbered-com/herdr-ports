@@ -8,10 +8,11 @@ and kill them.
 
 <img src="docs/sidebar.webp" width="300" alt="herdr sidebar with the ports badge">
 
-A listener belongs to a Space when its process cwd sits inside one of the
-Space's pane cwds, so servers started outside herdr still show up. There is no
-process-name filter. Panes sitting in `/` or `$HOME` are ignored, which keeps
-system daemons out.
+A listener belongs to the Space with the most specific pane cwd containing
+its process cwd, so servers started outside herdr still show up. Repository-root
+listeners do not badge nested worktrees, and worktree listeners prefer their
+own Space over the parent repository. There is no process-name filter.
+Panes sitting in `/` or `$HOME` are ignored, which keeps system daemons out.
 
 ## Install
 
@@ -44,9 +45,11 @@ Then `herdr server reload-config`.
 
 ## Popup
 
-- The table spans the pane: Space, Program, Ports, Path, then Pid, Mem and Cpu%
-  flush right. As the pane narrows, columns drop (Program, Mem and Cpu%, Path,
-  Pid), then Ports and Space crop. Long lists scroll with the cursor.
+- The table spans the pane: Space, Worktree, Program, Ports, Path, then Pid,
+  Mem and Cpu% flush right. Linked worktrees show their parent Space and a
+  separate worktree name; other rows show `-` in Worktree. The `list` command
+  also includes this column. Worktree hides below 60 columns; other columns
+  drop as the pane narrows. Long lists scroll with the cursor.
 - It refreshes every 3s, and only the screen lines that changed are repainted.
 - Mem and Cpu% totals of the listed rows sit top right, in line with their
   columns. A scrollbar appears when rows overflow.
