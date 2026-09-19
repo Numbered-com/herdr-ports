@@ -15,7 +15,7 @@ platforms = ["linux", "macos"]
 # sheds columns to fit
 [[panes]]
 id = "main"
-title = "ports"
+title = "Ports"
 placement = "popup"
 width = 140
 height = 24

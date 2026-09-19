@@ -48,8 +48,8 @@ Then `herdr server reload-config`.
   flush right. As the pane narrows, columns drop (Program, Mem and Cpu%, Path,
   Pid), then Ports and Space crop. Long lists scroll with the cursor.
 - It refreshes every 3s, and only the screen lines that changed are repainted.
-- The bottom line totals Mem and Cpu% of the listed rows under their columns. A
-  scrollbar appears when rows overflow.
+- Mem and Cpu% totals of the listed rows sit top right, in line with their
+  columns. A scrollbar appears when rows overflow.
 - Keyboard: arrows or `j` `k` move, `space` checks, `enter` kills the checked
   rows (or the highlighted one), `a` lists every listener on the machine, `r`
   refreshes, `esc` or `q` quits.

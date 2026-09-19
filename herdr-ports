@@ -536,7 +536,7 @@ popup() {
 		# rows, a metrics tick only the rows whose numbers moved. No subshells
 		# in this section - they are what made frames slow.
 		# Screen layout: title=1, blank=2, header/none=3, rows=4..n+3,
-		# CTA chips then the help line pinned on the pane's last line.
+		# help + CTA chips pinned on the pane's last line.
 		local frame='' line chk fl size c1 c2 cw cstart fstart thumb tpos
 		if [ "$resized" = 1 ]; then
 			resized=0
@@ -553,7 +553,7 @@ popup() {
 
 		# rows beyond the pane scroll with the cursor instead of running over
 		# the footer
-		vis=$((rows - 7))
+		vis=$((rows - 5))
 		[ "$vis" -lt 1 ] && vis=1
 		[ "$cur" -le "$top" ] && top=$((cur - 1))
 		[ "$cur" -gt $((top + vis)) ] && top=$((cur - vis))
@@ -617,7 +617,19 @@ popup() {
 		line='Listening in workspaces'
 		[ "$show_all" = 1 ] && line='All listeners'
 		scr[1]=$'\033[1m'"${line:0:cols-1}"$'\033[22m\033[38;5;'"$ACCENT"'m'
-		[ "$booting" = 0 ] && [ $((${#line} + ${#n} + 3)) -le "$cols" ] && scr[1]+="  $n"
+		k=${#line}
+		if [ "$booting" = 0 ] && [ $((k + ${#n} + 3)) -le "$cols" ]; then
+			scr[1]+="  $n"
+			k=$((k + ${#n} + 2))
+		fi
+		# totals of the listed rows, top right, in line with their columns
+		if [ "$memw" -gt 0 ] && [ "$n" -gt 0 ] && [ $((lcols - 1 - metw - k)) -ge 2 ]; then
+			scr[1]+=${PAD:0:lcols-1-metw-k}
+			fit "$tmem" "$memw" r ' '
+			scr[1]+=$GREEN$cell
+			fit "$tcpu" "$cpuw" r ' '
+			scr[1]+=$'\033[38;5;250m'"$cell"
+		fi
 		if [ "$n" = 0 ]; then
 			line='  none - "a" lists every listener on the machine'
 			[ "$booting" = 1 ] && line='  scanning…'
@@ -683,60 +695,47 @@ popup() {
 			fi
 		fi
 
-		# Footer: CTA chips like herdr's own (accent primary, gray secondary),
-		# then a blank line and the dim help line pinned bottom left. Every segment records its line + column span, so hints and
-		# chips are all clickable.
+		# Footer, one line: dim help on the left (replaced by the outcome of the
+		# last kill), CTA chips like herdr's own on the right (accent primary,
+		# gray secondary), flush with the table edge. Every segment records its
+		# column span, so hints and chips are all clickable.
 		bt3='a all'
 		[ "$show_all" = 1 ] && bt3='a spaces'
-		btn_line[2]=$rows
-		btn_line[3]=$rows
+		fstart=2
 		if [ -n "$status" ]; then
 			fl=$status
 			status=''
 			btn_start[2]=0 btn_end[2]=0 btn_start[3]=0 btn_end[3]=0
 		else
 			fl='↑↓ move · space check · '
-			btn_start[3]=$((${#fl} + 1))
+			btn_start[3]=$((${#fl} + 1 + fstart))
 			fl+="$bt3"
-			btn_end[3]=${#fl}
+			btn_end[3]=$((${#fl} + fstart))
 			fl+=' · '
-			btn_start[2]=$((${#fl} + 1))
+			btn_start[2]=$((${#fl} + 1 + fstart))
 			fl+='r refresh'
-			btn_end[2]=${#fl}
-		fi
-		# totals sit under their columns, the help line gets what is left
-		fstart=2
-		local tot='' totw=0
-		if [ "$memw" -gt 0 ] && [ "$n" -gt 0 ]; then
-			fit "$tmem" "$memw" r ' '
-			tot=$GREEN$cell
-			fit "$tcpu" "$cpuw" r ' '
-			tot+=$'\033[38;5;250m'"$cell"
-			totw=$metw
-		fi
-		k=$((lcols - 1 - fstart - totw))
-		[ "$k" -lt 0 ] && k=0
-		fit "$fl" "$k" l
-		fl=$cell
-		if [ "${btn_end[2]}" -gt 0 ]; then
-			for k in 2 3; do
-				btn_start[k]=$((btn_start[k] + fstart))
-				btn_end[k]=$((btn_end[k] + fstart))
-			done
+			btn_end[2]=$((${#fl} + fstart))
 		fi
 		c1=' ↵ kill '
 		c2=' esc close '
 		cw=$((${#c1} + 2 + ${#c2}))
-		cstart=$(((cols - cw) / 2))
+		cstart=$((lcols - cw))
 		[ "$cstart" -lt 1 ] && cstart=1
-		btn_line[1]=$((rows - 2))
 		btn_start[1]=$cstart
 		btn_end[1]=$((cstart + ${#c1} - 1))
-		btn_line[4]=$((rows - 2))
 		btn_start[4]=$((btn_end[1] + 3))
 		btn_end[4]=$((btn_start[4] + ${#c2} - 1))
-		scr[rows]="${PAD:0:fstart}"$'\033[38;5;244m'"$fl$tot"
-		scr[rows - 2]="${PAD:0:cstart-1}"$'\033[48;5;'"$ACCENT"$'m\033[38;5;16m'"$c1"$'\033[0m  \033[48;5;238m\033[38;5;253m'"$c2"$'\033[0m'
+		# the help line gets what the chips leave
+		k=$((cstart - 1 - fstart - 2))
+		[ "$k" -lt 0 ] && k=0
+		fit "$fl" "$k" l
+		cw=$((cstart - 1 - fstart - k))
+		[ "$cw" -lt 0 ] && cw=0
+		# the boot frame only paints left-anchored content: herdr may still be
+		# resizing the pane at that point, and anything pinned to the right
+		# edge would visibly jump once the real size lands
+		scr[rows]="${PAD:0:fstart}"$'\033[38;5;244m'"$cell"$'\033[0m'
+		[ "$booting" = 0 ] && scr[rows]+="${PAD:0:cw}"$'\033[48;5;'"$ACCENT"$'m\033[38;5;16m'"$c1"$'\033[0m  \033[48;5;238m\033[38;5;253m'"$c2"$'\033[0m'
 		# \033[K before the reset so the cursor row's background runs to the edge
 		# the scrollbar cell is painted after the erase, which would wipe it
 		for ((y = 1; y <= rows; y++)); do
@@ -804,7 +803,7 @@ popup() {
 										checked[cur]=$((1 - checked[cur]))
 									else
 										for k in 1 2 3 4; do
-											if [ "$my" = "${btn_line[k]:-0}" ] && [ "$mx" -ge "${btn_start[k]:-0}" ] && [ "$mx" -le "${btn_end[k]:-0}" ]; then
+											if [ "$my" = "$rows" ] && [ "$mx" -ge "${btn_start[k]:-0}" ] && [ "$mx" -le "${btn_end[k]:-0}" ]; then
 												case "$k" in
 													1) kill_targets ;;
 													2) needs_refresh=1 ;;
