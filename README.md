@@ -1,6 +1,6 @@
 # herdr-ports
 
-![herdr-ports popup](docs/popup.png)
+![herdr-ports popup](docs/popup.webp)
 
 See which [herdr](https://herdr.dev) Space has a live server, and kill it: a
 `$ports` badge on every Space running a TCP listener, plus a popup to inspect
