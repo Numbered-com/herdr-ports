@@ -46,6 +46,8 @@ Then `herdr server reload-config`.
   flush right. As the pane narrows, columns drop (Program, Mem and Cpu%, Path,
   Pid), then Ports and Space crop. Long lists scroll with the cursor.
 - It refreshes every 3s, and only the screen lines that changed are repainted.
+- The bottom line totals Mem and Cpu% of the listed rows under their columns. A
+  scrollbar appears when rows overflow.
 - Keyboard: arrows or `j` `k` move, `space` checks, `enter` kills the checked
   rows (or the highlighted one), `a` lists every listener on the machine, `r`
   refreshes, `esc` or `q` quits.
@@ -57,11 +59,14 @@ Then `herdr server reload-config`.
 | Variable | Default | |
 | --- | --- | --- |
 | `HERDR_PORTS_REFRESH` | `3` | popup refresh period in seconds, `0` disables |
+| `HERDR_PORTS_WHEEL` | `4` | wheel events per cursor step: `4` is one line per notch, `1` follows the terminal |
 | `HERDR_PORTS_ACCENT` | `223` | 256-color index of the accent, match your theme |
 | `HERDR_PORTS_INTERVAL` | `5` | badge watcher poll period in seconds |
 | `HERDR_PORTS_BADGE` | `↯` | badge glyph |
 
 ## How the badge works
+
+<img src="docs/sidebar.webp" width="300" alt="herdr sidebar with the ports badge">
 
 `herdr-ports watch` polls and posts a `ports` token as workspace metadata with
 a TTL, so the badge clears itself shortly after the last server dies. The

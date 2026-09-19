@@ -43,6 +43,10 @@ GREEN=$'\033[38;2;119;192;152m' # 77C098
 # Popup auto-refresh period in whole seconds (bash 3.2 read -t), 0 disables
 REFRESH="${HERDR_PORTS_REFRESH:-3}"
 case "$REFRESH" in '' | *[!0-9]*) REFRESH=3 ;; esac
+# Wheel events that make one cursor step. Terminals send 3-4 events per notch:
+# 4 gives one line per notch, 1 follows the terminal natively
+WHEEL="${HERDR_PORTS_WHEEL:-4}"
+case "$WHEEL" in '' | 0 | *[!0-9]*) WHEEL=4 ;; esac
 
 # One line per (pid, port) TCP listener: "pid<TAB>port".
 # Fastest one-shot kernel dump per platform (~5ms vs ~70ms for lsof, which
@@ -214,7 +218,7 @@ ps_each() {
 # rss arrives in KB; btop-style short units
 AWK_MEM='function mem(k) { return k >= 1048576 ? sprintf("%.1fG", k / 1048576) : k >= 1024 ? int(k / 1024) "M" : k "K" }'
 
-# "space<TAB>pid<TAB>:p1 :p2<TAB>cwd<TAB>mem<TAB>cpu<TAB>cmd" sorted by space then first port;
+# "space<TAB>pid<TAB>:p1 :p2<TAB>cwd<TAB>mem<TAB>cpu<TAB>rss<TAB>cmd" sorted by space then first port;
 # space is "-" for listeners outside any herdr workspace (sorted last)
 build_rows() {
 	local tmp="$1" pids j1 j2
@@ -258,19 +262,19 @@ build_rows() {
 	awk -F'\t' -v OFS='\t' "$AWK_MEM"'
 		FILENAME == ARGV[1] {
 			line = $0; sub(/^ +/, "", line); split(line, f, / +/)
-			m[f[1]] = mem(f[2]); c[f[1]] = f[3]
+			m[f[1]] = mem(f[2]); c[f[1]] = f[3]; k[f[1]] = f[2]
 			sub(/^[0-9]+ +[0-9]+ +[0-9.,]+ +/, "", line); gsub(/\t/, " ", line)
 			a[f[1]] = line
 			next
 		}
-		{ print $1, $2, $3, $4, ($2 in m ? m[$2] : "-"), ($2 in c ? c[$2] : "-"), ($2 in a ? a[$2] : "?") }
+		{ print $1, $2, $3, $4, ($2 in m ? m[$2] : "-"), ($2 in c ? c[$2] : "-"), ($2 in k ? k[$2] : 0), ($2 in a ? a[$2] : "?") }
 	' "$tmp/ps" "$tmp/base"
 }
 
-# "pid mem cpu" for the pids in $1 - the cheap path of the popup timer (no
+# "pid mem cpu rss" for the pids in $1 - the cheap path of the popup timer (no
 # socket/cwd/workspace lookups)
 pid_metrics() {
-	ps_each "$1" -o pid= -o rss= -o %cpu= | awk "$AWK_MEM"'{ print $1, mem($2), $3 }'
+	ps_each "$1" -o pid= -o rss= -o %cpu= | awk "$AWK_MEM"'{ print $1, mem($2), $3, $2 }'
 }
 
 shorten() {
@@ -283,10 +287,10 @@ list_mode() {
 	# not local: the EXIT trap fires after this returned, under set -u
 	tmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports.XXXXXX")
 	trap 'rm -rf "$tmp"' EXIT
-	local space pid ports cwd mem cpu cmd
+	local space pid ports cwd mem cpu rss cmd
 	build_rows "$tmp" > "$tmp/rows"
 	printf '%-12s %-20s %-7s %-30s %s\n' 'SPACE' 'PORTS' 'PID' 'PATH' 'COMMAND'
-	while IFS=$'\t' read -r space pid ports cwd mem cpu cmd; do
+	while IFS=$'\t' read -r space pid ports cwd mem cpu rss cmd; do
 		printf '%-12.12s %-20s %-7s %-30s %s\n' "$space" "$ports" "$pid" "$(shorten "$cwd")" "${cmd:0:60}"
 	done < "$tmp/rows"
 }
@@ -319,13 +323,36 @@ fit() {
 # Helpers below run inside popup() via bash dynamic scoping: they read and
 # mutate its locals (n, cur, checked, pids, needs_refresh).
 cursor_up() {
-	[ "$n" -gt 0 ] && cur=$((cur > 1 ? cur - 1 : n))
+	[ "$cur" -gt 1 ] && cur=$((cur - 1))
 	return 0
 }
 
 cursor_down() {
-	[ "$n" -gt 0 ] && cur=$((cur < n ? cur + 1 : 1))
+	[ "$cur" -lt "$n" ] && cur=$((cur + 1))
 	return 0
+}
+
+# Totals of the listed rows into $tmem/$tcpu, shown under the MEM and CPU%
+# columns. Integer math only: cpu is summed in tenths ("12.4" -> 124).
+sum_totals() {
+	local i k=0 c=0 v
+	for ((i = 1; i <= n; i++)); do
+		case "${rsss[i]}" in '' | *[!0-9]*) ;; *) k=$((k + rsss[i])) ;; esac
+		v=${cpus[i]/,/.}
+		case "$v" in
+			*[!0-9.]* | '' | *.*.*) ;;
+			*.*) c=$((c + 10#${v%.*}0 + 10#${v#*.})) ;;
+			*) c=$((c + 10#${v}0)) ;;
+		esac
+	done
+	if [ "$k" -ge 1048576 ]; then
+		tmem="$((k / 1048576)).$((k % 1048576 * 10 / 1048576))G"
+	elif [ "$k" -ge 1024 ]; then
+		tmem="$((k / 1024))M"
+	else
+		tmem="${k}K"
+	fi
+	tcpu="$((c / 10)).$((c % 10))"
 }
 
 # TERM the checked rows (or the highlighted one when none checked). Instead of
@@ -377,11 +404,33 @@ kill_targets() {
 # yields nothing after VTIME (0.1s). This sidesteps bash 3.2's integer-only
 # read -t, which would stall a bare Escape for a full second. When stdin is
 # not a tty (tests, pipes), dd just reads the pending buffer.
+#
+# Fast path, fork-free: ask the terminal for a status report (DSR 5n). Its
+# "\e[0n" reply queues up BEHIND whatever input is already pending, so reading
+# byte by byte until the reply shows up slurps the whole backlog (a wheel flick
+# is dozens of events) in one go, and a bare Escape is recognised instantly as
+# "nothing before the reply". A terminal that never answers costs one 1s
+# timeout, after which the stty/dd path below takes over for good.
 read_esc_tail() {
-	local saved='' tries=0
+	local saved='' tries=0 ch
+	seq=''
+	if [ "$dsr_ok" = 1 ]; then
+		printf '\033[5n'
+		while IFS= read -rsn1 -t 1 ch; do
+			seq+=$ch
+			case "$seq" in
+				*$'\e[0n')
+					seq=${seq%$'\e[0n'}
+					return 0
+					;;
+			esac
+		done
+		dsr_ok=0
+		return 0
+	fi
 	saved=$(stty -g 2> /dev/null) || true
 	[ -n "$saved" ] && stty -icanon -echo min 0 time 1 2> /dev/null
-	seq=$(dd bs=64 count=1 2> /dev/null)
+	seq=$(dd bs=4096 count=1 2> /dev/null)
 	# a burst can split across read(2) calls: keep reading while the tail is
 	# an obviously unfinished sequence (lone CSI/SS3 introducer, or a mouse
 	# event missing its M/m terminator), else the dropped half would be
@@ -394,7 +443,7 @@ read_esc_tail() {
 				;;
 			*) break ;;
 		esac
-		seq="$seq$(dd bs=64 count=1 2> /dev/null)"
+		seq="$seq$(dd bs=4096 count=1 2> /dev/null)"
 		tries=$((tries + 1))
 	done
 	[ -n "$saved" ] && stty "$saved" 2> /dev/null
@@ -403,11 +452,17 @@ read_esc_tail() {
 
 popup() {
 	local show_all=0 n=0 cur=1 top=0 msp=0 mpo=0 mpa=0 mpr=0 needs_refresh=1 needs_view=0 booting=1 i key seq prev status=''
-	local tick=0 resized=1 lastports='' list y t0 rc
-	local space pid ports cwd mem cpu cmd mbuf body mb mx my bt3 k ev term rows=24 cols=80
+	local tick=0 resized=1 lastports='' list y t0 rc dsr_ok=1 wacc=0
+	local space pid ports cwd mem cpu rss cmd tmem='' tcpu='' mbuf body mb mx my bt3 k ev term rows=24 cols=80
 	# not local: the EXIT trap fires after popup() returned, under set -u
 	tmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports.XXXXXX")
-	trap 'rm -rf "$tmp"; printf "\033[?1006l\033[?1000l\033[?25h"' EXIT
+	# Echo stays off for the whole popup, not just inside read -s: wheel bursts
+	# landing while a refresh runs would otherwise be echoed by the tty as
+	# "^[[<65;70;9M" garbage over rows the diffed redraw never repaints.
+	# not local either: restored by the EXIT trap
+	tty_saved=$(stty -g 2> /dev/null) || tty_saved=''
+	[ -n "$tty_saved" ] && stty -echo -icanon min 1 time 0 2> /dev/null
+	trap 'rm -rf "$tmp"; [ -n "$tty_saved" ] && stty "$tty_saved" 2> /dev/null; printf "\033[?1006l\033[?1000l\033[?25h"' EXIT
 	# the pane size is only re-queried (a stty fork) after a resize
 	trap 'resized=1' WINCH
 	# SGR mouse reporting (1000h+1006h): herdr forwards mouse to pane apps
@@ -424,11 +479,12 @@ popup() {
 				needs_refresh=1
 			elif [ "$n" -gt 0 ]; then
 				list=${pids[*]}
-				while read -r pid mem cpu; do
+				while read -r pid mem cpu rss; do
 					for ((i = 1; i <= n; i++)); do
-						[ "${pids[i]}" = "$pid" ] && mems[i]=$mem cpus[i]=$cpu && break
+						[ "${pids[i]}" = "$pid" ] && mems[i]=$mem cpus[i]=$cpu rsss[i]=$rss && break
 					done
 				done < <(pid_metrics "$list")
+				sum_totals
 			fi
 		fi
 		# needs_refresh rebuilds the rows (slow: sockets, cwds, herdr snapshot);
@@ -448,11 +504,12 @@ popup() {
 				[ "${checked[i]:-0}" = 1 ] && prev="$prev${pids[i]} "
 			done
 			n=0 msp=0 mpo=0 mpa=0 mpr=0
-			while IFS=$'\t' read -r space pid ports cwd mem cpu cmd; do
+			while IFS=$'\t' read -r space pid ports cwd mem cpu rss cmd; do
 				[ "$show_all" = 0 ] && [ "$space" = - ] && continue
 				n=$((n + 1))
 				mems[n]=$mem
 				cpus[n]=$cpu
+				rsss[n]=$rss
 				spaces[n]=$space
 				pids[n]=$pid
 				portss[n]=$ports
@@ -469,6 +526,7 @@ popup() {
 			done < "$tmp/rows"
 			[ "$cur" -gt "$n" ] && cur=$n
 			[ "$cur" -lt 1 ] && cur=1
+			sum_totals
 			needs_refresh=0 needs_view=0
 		fi
 
@@ -478,8 +536,8 @@ popup() {
 		# rows, a metrics tick only the rows whose numbers moved. No subshells
 		# in this section - they are what made frames slow.
 		# Screen layout: title=1, blank=2, header/none=3, rows=4..n+3,
-		# footer bar pinned on the pane's last line.
-		local frame='' line chk fl size c1 c2 cw cstart
+		# CTA chips then the help line pinned on the pane's last line.
+		local frame='' line chk fl size c1 c2 cw cstart fstart thumb tpos
 		if [ "$resized" = 1 ]; then
 			resized=0
 			size=$(stty size 2> /dev/null) || size=''
@@ -491,6 +549,20 @@ popup() {
 			frame=$'\033[2J'
 		fi
 		scr=()
+		sbar=()
+
+		# rows beyond the pane scroll with the cursor instead of running over
+		# the footer
+		vis=$((rows - 7))
+		[ "$vis" -lt 1 ] && vis=1
+		[ "$cur" -le "$top" ] && top=$((cur - 1))
+		[ "$cur" -gt $((top + vis)) ] && top=$((cur - vis))
+		[ "$top" -lt 0 ] && top=0
+		last=$((top + vis))
+		[ "$last" -gt "$n" ] && last=$n
+		# the scrollbar takes the last column plus a gap when rows overflow
+		lcols=$cols
+		[ "$n" -gt "$vis" ] && lcols=$((cols - 2))
 
 		# btop-style columns: SPACE and PORTS hug their content, PROGRAM and PATH
 		# share what is left (PATH absorbs the slack), PID MEM CPU% sit flush
@@ -498,17 +570,17 @@ popup() {
 		# in order (PROGRAM, MEM+CPU%, PATH, PID), then PORTS and SPACE crop.
 		# No line may ever wrap: a wrapped row shifts everything below and
 		# breaks the click hitboxes.
-		local spw=$msp pw=$mpo pidw=7 pathw=0 cmdw=0 memw=0 cpuw=0 metw=13 rest avail vis last
+		local spw=$msp pw=$mpo pidw=7 pathw=0 cmdw=0 memw=0 cpuw=0 metw=13 rest avail vis last lcols
 		[ "$spw" -lt 5 ] && spw=5
 		[ "$spw" -gt 20 ] && spw=20
 		[ "$pw" -lt 5 ] && pw=5
 		[ "$pw" -gt 24 ] && pw=24
 		# width left for PROGRAM + PATH, their gaps included
-		rest=$((cols - 6 - spw - 1 - pw - 1 - pidw - 1))
+		rest=$((lcols - 6 - spw - 1 - pw - 1 - pidw - 1))
 		if [ "$rest" -lt 13 ]; then
 			[ "$spw" -gt 12 ] && spw=12
 			[ "$pw" -gt 12 ] && pw=12
-			rest=$((cols - 6 - spw - 1 - pw - 1 - pidw - 1))
+			rest=$((lcols - 6 - spw - 1 - pw - 1 - pidw - 1))
 		fi
 		if [ $((rest - metw)) -ge 13 ]; then
 			memw=6 cpuw=5
@@ -530,7 +602,7 @@ popup() {
 			[ "$pw" -lt 5 ] && pw=5
 		else
 			pidw=0
-			avail=$((cols - 7))
+			avail=$((lcols - 7))
 			pw=$((avail - spw - 1))
 			[ "$pw" -gt "$mpo" ] && pw=$mpo
 			if [ $((spw + 1 + pw)) -gt "$avail" ]; then
@@ -541,16 +613,6 @@ popup() {
 				fi
 			fi
 		fi
-
-		# rows beyond the pane scroll with the cursor instead of running over
-		# the footer
-		vis=$((rows - 5))
-		[ "$vis" -lt 1 ] && vis=1
-		[ "$cur" -le "$top" ] && top=$((cur - 1))
-		[ "$cur" -gt $((top + vis)) ] && top=$((cur - vis))
-		[ "$top" -lt 0 ] && top=0
-		last=$((top + vis))
-		[ "$last" -gt "$n" ] && last=$n
 
 		line='Listening in workspaces'
 		[ "$show_all" = 1 ] && line='All listeners'
@@ -606,21 +668,34 @@ popup() {
 				line+=$'\033[38;5;250m'"$cell"
 				scr[i - top + 3]=$line
 			done
+			# scrollbar in the free right-margin column, only when rows overflow
+			if [ "$n" -gt "$vis" ]; then
+				thumb=$((vis * vis / n))
+				[ "$thumb" -lt 1 ] && thumb=1
+				tpos=$((top * (vis - thumb) / (n - vis)))
+				for ((i = 0; i < vis; i++)); do
+					if [ "$i" -ge "$tpos" ] && [ "$i" -lt $((tpos + thumb)) ]; then
+						sbar[i + 4]=$'\033['"$cols"$'G\033[38;5;245m█\033[0m'
+					else
+						sbar[i + 4]=$'\033['"$cols"$'G\033[38;5;238m│\033[0m'
+					fi
+				done
+			fi
 		fi
 
-		# Footer, native-settings style: a dim hint line, then CTA chips like
-		# herdr's own (accent primary, gray secondary). Every segment records
-		# its line + column span, so hints and chips are all clickable.
+		# Footer: CTA chips like herdr's own (accent primary, gray secondary),
+		# then a blank line and the dim help line pinned bottom left. Every segment records its line + column span, so hints and
+		# chips are all clickable.
 		bt3='a all'
 		[ "$show_all" = 1 ] && bt3='a spaces'
-		btn_line[2]=$((rows - 1))
-		btn_line[3]=$((rows - 1))
+		btn_line[2]=$rows
+		btn_line[3]=$rows
 		if [ -n "$status" ]; then
-			fl="  $status"
+			fl=$status
 			status=''
 			btn_start[2]=0 btn_end[2]=0 btn_start[3]=0 btn_end[3]=0
 		else
-			fl='  ↑↓ move · space check · '
+			fl='↑↓ move · space check · '
 			btn_start[3]=$((${#fl} + 1))
 			fl+="$bt3"
 			btn_end[3]=${#fl}
@@ -629,25 +704,46 @@ popup() {
 			fl+='r refresh'
 			btn_end[2]=${#fl}
 		fi
-		fl=${fl:0:cols-1}
+		# totals sit under their columns, the help line gets what is left
+		fstart=2
+		local tot='' totw=0
+		if [ "$memw" -gt 0 ] && [ "$n" -gt 0 ]; then
+			fit "$tmem" "$memw" r ' '
+			tot=$GREEN$cell
+			fit "$tcpu" "$cpuw" r ' '
+			tot+=$'\033[38;5;250m'"$cell"
+			totw=$metw
+		fi
+		k=$((lcols - 1 - fstart - totw))
+		[ "$k" -lt 0 ] && k=0
+		fit "$fl" "$k" l
+		fl=$cell
+		if [ "${btn_end[2]}" -gt 0 ]; then
+			for k in 2 3; do
+				btn_start[k]=$((btn_start[k] + fstart))
+				btn_end[k]=$((btn_end[k] + fstart))
+			done
+		fi
 		c1=' ↵ kill '
 		c2=' esc close '
 		cw=$((${#c1} + 2 + ${#c2}))
 		cstart=$(((cols - cw) / 2))
 		[ "$cstart" -lt 1 ] && cstart=1
-		btn_line[1]=$rows
+		btn_line[1]=$((rows - 2))
 		btn_start[1]=$cstart
 		btn_end[1]=$((cstart + ${#c1} - 1))
-		btn_line[4]=$rows
+		btn_line[4]=$((rows - 2))
 		btn_start[4]=$((btn_end[1] + 3))
 		btn_end[4]=$((btn_start[4] + ${#c2} - 1))
-		scr[rows - 1]=$'\033[38;5;244m'"$fl"
-		scr[rows]="${PAD:0:cstart-1}"$'\033[48;5;'"$ACCENT"$'m\033[38;5;16m'"$c1"$'\033[0m  \033[48;5;238m\033[38;5;253m'"$c2"$'\033[0m'
+		scr[rows]="${PAD:0:fstart}"$'\033[38;5;244m'"$fl$tot"
+		scr[rows - 2]="${PAD:0:cstart-1}"$'\033[48;5;'"$ACCENT"$'m\033[38;5;16m'"$c1"$'\033[0m  \033[48;5;238m\033[38;5;253m'"$c2"$'\033[0m'
 		# \033[K before the reset so the cursor row's background runs to the edge
+		# the scrollbar cell is painted after the erase, which would wipe it
 		for ((y = 1; y <= rows; y++)); do
-			[ "${scr[y]:-}" = "${old[y]:-}" ] && continue
-			frame+=$'\033['"$y"$';1H'"${scr[y]:-}"$'\033[K\033[0m'
-			old[y]=${scr[y]:-}
+			line="${scr[y]:-}${sbar[y]:-}"
+			[ "$line" = "${old[y]:-}" ] && continue
+			frame+=$'\033['"$y"$';1H'"${scr[y]:-}"$'\033[K\033[0m'"${sbar[y]:-}"
+			old[y]=$line
 		done
 		[ -n "$frame" ] && printf '%s' "$frame"
 		if [ "$booting" = 1 ]; then
@@ -680,6 +776,7 @@ popup() {
 				read_esc_tail
 				[ -z "$seq" ] && exit 0
 				mbuf=$seq
+				wacc=0
 				while [ -n "$mbuf" ]; do
 					case "$mbuf" in
 						$'\e'*) mbuf=${mbuf#$'\e'} ;;
@@ -722,12 +819,19 @@ popup() {
 										done
 									fi
 									;;
-								64) cursor_up ;;
-								65) cursor_down ;;
+								64) wacc=$((wacc - 1)) ;;
+								65) wacc=$((wacc + 1)) ;;
 							esac
 							;;
 						*) break ;;
 					esac
+				done
+				# terminals send several wheel events per notch (3-4): a burst
+				# of up to WHEEL events is one step, rounded up so a notch
+				# always moves, and a whole backlog is applied before a single
+				# redraw
+				for ((i = (${wacc#-} + WHEEL - 1) / WHEEL; i > 0; i--)); do
+					if [ "$wacc" -lt 0 ]; then cursor_up; else cursor_down; fi
 				done
 				;;
 			k) cursor_up ;;
@@ -738,7 +842,7 @@ popup() {
 				show_all=$((1 - show_all))
 				needs_view=1
 				;;
-			r) needs_refresh=1 ;;
+			r) needs_refresh=1 resized=1 ;; # also a full repaint, should the screen ever get corrupted
 			q) exit 0 ;;
 		esac
 	done

@@ -3,7 +3,7 @@
 # Local dev: herdr plugin link /path/to/herdr-ports
 id = "numbered.ports"
 name = "Ports"
-version = "0.2.0"
+version = "0.3.0"
 description = "Active dev servers per Space: sidebar $ports badge + kill popup"
 min_herdr_version = "0.7.4"
 platforms = ["linux", "macos"]
