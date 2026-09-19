@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# herdr-ports - surface active dev servers in herdr.
+# herdr-ports - surface TCP listeners running inside herdr workspaces.
 #
 #   herdr-ports               interactive popup: checkbox list of servers, kill them
 #   herdr-ports list          print the table once and exit (scripting/debug)
@@ -39,6 +39,10 @@ INTERVAL="${HERDR_PORTS_INTERVAL:-5}"
 # buttons (223 ~ vesper's peach). Panes render with the terminal palette, not
 # herdr's theme, so the exact accent cannot be queried - override to match.
 ACCENT="${HERDR_PORTS_ACCENT:-223}"
+GREEN=$'\033[38;2;119;192;152m' # 77C098
+# Popup auto-refresh period in whole seconds (bash 3.2 read -t), 0 disables
+REFRESH="${HERDR_PORTS_REFRESH:-3}"
+case "$REFRESH" in '' | *[!0-9]*) REFRESH=3 ;; esac
 
 # One line per (pid, port) TCP listener: "pid<TAB>port".
 # Fastest one-shot kernel dump per platform (~5ms vs ~70ms for lsof, which
@@ -96,13 +100,15 @@ pid_cwds() {
 	fi
 }
 
-# "workspace_id<TAB>cwd" for every pane (empty when the herdr server is down)
+# "workspace_id<TAB>cwd" for every pane (empty when the herdr server is down).
+# Panes idling in $HOME are dropped like "/": every user daemon lives under it
+# (~/Library/Containers/...) and would be claimed by that pane's Space.
 workspace_cwds() {
-	"$HERDR" api snapshot 2> /dev/null | jq -r '
+	"$HERDR" api snapshot 2> /dev/null | jq -r --arg home "$HOME" '
 		.. | objects | select(has("pane_id") and has("workspace_id"))
 		| .workspace_id as $w
 		| ([.cwd?, .foreground_cwd?] | unique | .[])
-		| select(type == "string" and . != "" and . != "/")
+		| select(type == "string" and . != "" and . != "/" and . != $home)
 		| "\($w)\t\(.)"
 	' 2> /dev/null | sort -u
 }
@@ -192,10 +198,13 @@ ensure_watch() {
 	nohup "$self" watch > /dev/null 2>&1 &
 }
 
-# "space<TAB>pid<TAB>:p1 :p2<TAB>cwd<TAB>cmd" sorted by space then first port;
+# rss arrives in KB; btop-style short units
+AWK_MEM='function mem(k) { return k >= 1048576 ? sprintf("%.1fG", k / 1048576) : k >= 1024 ? int(k / 1024) "M" : k "K" }'
+
+# "space<TAB>pid<TAB>:p1 :p2<TAB>cwd<TAB>mem<TAB>cpu<TAB>cmd" sorted by space then first port;
 # space is "-" for listeners outside any herdr workspace (sorted last)
 build_rows() {
-	local tmp="$1" space pid ports cwd cmd
+	local tmp="$1" pids
 	pid_ports > "$tmp/ports"
 	pid_cwds < "$tmp/ports" > "$tmp/cwds"
 	workspace_cwds > "$tmp/ws"
@@ -213,16 +222,28 @@ build_rows() {
 				printf "%s\t%05d\t%s\t%s\t%s\t%s\n", (space == "-" ? "~" : space), first[p], space, p, ports[p], (p in cwd ? cwd[p] : "-")
 			}
 		}
-	' "$tmp/labels" "$tmp/pidws" "$tmp/ports" "$tmp/cwds" | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2 | cut -f3- \
-		| while IFS=$'\t' read -r space pid ports cwd; do
-			cmd=$(ps -o args= -p "$pid" 2> /dev/null | head -1)
-			# tabs would shift the TSV fields read back by the consumers, and
-			# bash substring truncation is character-based, unlike cut -c
-			# which can slice a multibyte UTF-8 char in half
-			cmd=${cmd//$'\t'/ }
-			cmd=${cmd:0:60}
-			printf '%s\t%s\t%s\t%s\t%s\n' "$space" "$pid" "$ports" "$cwd" "${cmd:-?}"
-		done
+	' "$tmp/labels" "$tmp/pidws" "$tmp/ports" "$tmp/cwds" | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2 | cut -f3- > "$tmp/base"
+	# one ps for every pid instead of one per row
+	pids=$(cut -f2 "$tmp/base" | paste -s -d, -)
+	[ -n "$pids" ] || return 0
+	ps -o pid= -o rss= -o %cpu= -o args= -p "$pids" 2> /dev/null > "$tmp/ps"
+	# tabs in args would shift the TSV fields read back by the consumers
+	awk -F'\t' -v OFS='\t' "$AWK_MEM"'
+		FILENAME == ARGV[1] {
+			line = $0; sub(/^ +/, "", line); split(line, f, / +/)
+			m[f[1]] = mem(f[2]); c[f[1]] = f[3]
+			sub(/^[0-9]+ +[0-9]+ +[0-9.,]+ +/, "", line); gsub(/\t/, " ", line)
+			a[f[1]] = line
+			next
+		}
+		{ print $1, $2, $3, $4, ($2 in m ? m[$2] : "-"), ($2 in c ? c[$2] : "-"), ($2 in a ? a[$2] : "?") }
+	' "$tmp/ps" "$tmp/base"
+}
+
+# stdin-free: "pid mem cpu" for the comma-separated pids in $1 - the cheap
+# path of the popup timer (one ps, no socket/cwd/workspace lookups)
+pid_metrics() {
+	ps -o pid= -o rss= -o %cpu= -p "$1" 2> /dev/null | awk "$AWK_MEM"'{ print $1, mem($2), $3 }'
 }
 
 shorten() {
@@ -235,12 +256,37 @@ list_mode() {
 	# not local: the EXIT trap fires after this returned, under set -u
 	tmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports.XXXXXX")
 	trap 'rm -rf "$tmp"' EXIT
-	local space pid ports cwd cmd
+	local space pid ports cwd mem cpu cmd
 	build_rows "$tmp" > "$tmp/rows"
 	printf '%-12s %-20s %-7s %-30s %s\n' 'SPACE' 'PORTS' 'PID' 'PATH' 'COMMAND'
-	while IFS=$'\t' read -r space pid ports cwd cmd; do
-		printf '%-12.12s %-20s %-7s %-30s %s\n' "$space" "$ports" "$pid" "$(shorten "$cwd")" "$cmd"
+	while IFS=$'\t' read -r space pid ports cwd mem cpu cmd; do
+		printf '%-12.12s %-20s %-7s %-30s %s\n' "$space" "$ports" "$pid" "$(shorten "$cwd")" "${cmd:0:60}"
 	done < "$tmp/rows"
+}
+
+# Pad or crop $1 to exactly $2 columns into $cell, without a subshell and
+# counting characters (printf widths count bytes on bash 3.2). Modes: l crops
+# the right edge btop-style, e crops with an ellipsis, t keeps the tail (the
+# informative end of a path), r right-aligns. $4 is a gap emitted before the
+# cell only when the column is shown.
+printf -v PAD '%*s' 400 ''
+fit() {
+	local t=$1 w=$2
+	cell=''
+	[ "$w" -gt 0 ] || return 0
+	local gap=${4:-}
+	if [ ${#t} -gt "$w" ]; then
+		case "$3" in
+			e) t="${t:0:w-1}…" ;;
+			t) t="…${t:${#t}-w+1}" ;;
+			*) t=${t:0:w} ;;
+		esac
+	fi
+	if [ "$3" = r ]; then
+		cell="$gap${PAD:0:w-${#t}}$t"
+	else
+		cell="$gap$t${PAD:0:w-${#t}}"
+	fi
 }
 
 # Helpers below run inside popup() via bash dynamic scoping: they read and
@@ -329,19 +375,39 @@ read_esc_tail() {
 }
 
 popup() {
-	local show_all=0 n='' cur=1 needs_refresh=1 i key seq prev status=''
-	local space pid ports cwd cmd mbuf body mb mx my bt3 k ev term rows=24 cols=80
+	local show_all=0 n='' cur=1 top=0 msp=0 mpo=0 mpa=0 mpr=0 needs_refresh=1 i key seq prev status=''
+	local tick=0 resized=1 lastports='' list y t0 rc
+	local space pid ports cwd mem cpu cmd mbuf body mb mx my bt3 k ev term rows=24 cols=80
 	# not local: the EXIT trap fires after popup() returned, under set -u
 	tmp=$(mktemp -d "${TMPDIR:-/tmp}/herdr-ports.XXXXXX")
 	trap 'rm -rf "$tmp"; printf "\033[?1006l\033[?1000l\033[?25h"' EXIT
-	# full clear only once at entry - per-keypress frames home the cursor and
-	# overwrite in place instead, which is what kills the flicker. SGR mouse
-	# reporting (1000h+1006h): herdr forwards mouse to pane apps requesting it.
-	printf '\033[?25l\033[2J\033[H\033[?1000h\033[?1006h'
+	# the pane size is only re-queried (a stty fork) after a resize
+	trap 'resized=1' WINCH
+	# SGR mouse reporting (1000h+1006h): herdr forwards mouse to pane apps
+	# requesting it
+	printf '\033[?25l\033[?1000h\033[?1006h'
 
 	while :; do
+		# Timer tick, cheap path: one netstat to see whether the listener set
+		# moved; if not, a single ps refreshes MEM/CPU% in place. The full
+		# rebuild (cwds, herdr snapshot, labels) only runs when it did.
+		if [ "$tick" = 1 ]; then
+			tick=0
+			if [ "$(pid_ports)" != "$lastports" ]; then
+				needs_refresh=1
+			elif [ "$n" -gt 0 ]; then
+				list=${pids[1]}
+				for ((i = 2; i <= n; i++)); do list+=,${pids[i]}; done
+				while read -r pid mem cpu; do
+					for ((i = 1; i <= n; i++)); do
+						[ "${pids[i]}" = "$pid" ] && mems[i]=$mem cpus[i]=$cpu && break
+					done
+				done < <(pid_metrics "$list")
+			fi
+		fi
 		if [ "$needs_refresh" = 1 ]; then
 			build_rows "$tmp" > "$tmp/rows"
+			lastports=$(< "$tmp/ports")
 			if [ "$show_all" = 1 ]; then
 				cp "$tmp/rows" "$tmp/view"
 			else
@@ -352,16 +418,22 @@ popup() {
 			for ((i = 1; i <= ${n:-0}; i++)); do
 				[ "${checked[i]:-0}" = 1 ] && prev="$prev${pids[i]} "
 			done
-			n=0
-			while IFS=$'\t' read -r space pid ports cwd cmd; do
+			n=0 msp=0 mpo=0 mpa=0 mpr=0
+			while IFS=$'\t' read -r space pid ports cwd mem cpu cmd; do
 				n=$((n + 1))
+				mems[n]=$mem
+				cpus[n]=$cpu
 				spaces[n]=$space
 				pids[n]=$pid
 				portss[n]=$ports
-				# shortened once here: the render loop below runs on every
-				# keypress and must stay free of subshells to avoid flicker
-				paths[n]=$(shorten "$cwd")
-				cmds[n]=$cmd
+				# content widths measured once here: the render loop below runs
+				# on every keypress and must stay free of subshells
+				paths[n]=${cwd/#$HOME/\~}
+				[ ${#space} -gt "$msp" ] && msp=${#space}
+				[ ${#ports} -gt "$mpo" ] && mpo=${#ports}
+				[ ${#paths[n]} -gt "$mpa" ] && mpa=${#paths[n]}
+				cmds[n]=${cmd:0:300}
+				[ ${#cmds[n]} -gt "$mpr" ] && mpr=${#cmds[n]}
 				checked[n]=0
 				case "$prev" in *" $pid "*) checked[n]=1 ;; esac
 			done < "$tmp/view"
@@ -370,48 +442,137 @@ popup() {
 			needs_refresh=0
 		fi
 
-		# Flicker-free redraw: one frame assembled in memory, cursor homed
-		# (\033[H, no full clear), every line erased to EOL (\033[K), leftovers
-		# erased with \033[J, all emitted in a single write. No subshells in
-		# this section - they are what made frames slow.
+		# Flicker-free redraw: every screen line is assembled into scr[], diffed
+		# against what is already on screen (old[]) and only the lines that
+		# changed are repainted, in a single write - a cursor move repaints two
+		# rows, a metrics tick only the rows whose numbers moved. No subshells
+		# in this section - they are what made frames slow.
 		# Screen layout: title=1, blank=2, header/none=3, rows=4..n+3,
 		# footer bar pinned on the pane's last line.
-		local frame='' line mark chk suffix fl size c1 c2 cw cstart
-		size=$(stty size 2> /dev/null) || size=''
-		rows=${size%% *}
-		cols=${size##* }
-		case "$rows" in '' | *[!0-9]*) rows=24 ;; esac
-		case "$cols" in '' | *[!0-9]*) cols=80 ;; esac
+		local frame='' line chk fl size c1 c2 cw cstart
+		if [ "$resized" = 1 ]; then
+			resized=0
+			size=$(stty size 2> /dev/null) || size=''
+			rows=${size%% *}
+			cols=${size##* }
+			case "$rows" in '' | *[!0-9]*) rows=24 ;; esac
+			case "$cols" in '' | *[!0-9]*) cols=80 ;; esac
+			old=()
+			frame=$'\033[2J'
+		fi
+		scr=()
 
-		# COMMAND gets whatever width remains after the fixed columns (79
-		# cols); without this cap long lines wrap in narrow panes and shift
-		# every row below, breaking the click hitboxes
-		local cmdw=$((cols - 79))
-		[ "$cmdw" -lt 0 ] && cmdw=0
-
-		frame=$'\033[H'
-		suffix=''
-		[ "$show_all" = 1 ] && suffix=' (all listeners)'
-		frame+=$'\033[1m'"Active dev servers$suffix"$'\033[0m\033[K\n\033[K\n'
-		if [ "$n" = 0 ]; then
-			frame+='  (none - "a" includes listeners outside herdr workspaces)'$'\033[K\n'
+		# btop-style columns: SPACE and PORTS hug their content, PROGRAM and PATH
+		# share what is left (PATH absorbs the slack), PID MEM CPU% sit flush
+		# right so the table spans the pane. As the pane narrows columns drop
+		# in order (PROGRAM, MEM+CPU%, PATH, PID), then PORTS and SPACE crop.
+		# No line may ever wrap: a wrapped row shifts everything below and
+		# breaks the click hitboxes.
+		local spw=$msp pw=$mpo pidw=7 pathw=0 cmdw=0 memw=0 cpuw=0 metw=13 rest avail vis last
+		[ "$spw" -lt 5 ] && spw=5
+		[ "$spw" -gt 20 ] && spw=20
+		[ "$pw" -lt 5 ] && pw=5
+		[ "$pw" -gt 24 ] && pw=24
+		# width left for PROGRAM + PATH, their gaps included
+		rest=$((cols - 6 - spw - 1 - pw - 1 - pidw - 1))
+		if [ "$rest" -lt 13 ]; then
+			[ "$spw" -gt 12 ] && spw=12
+			[ "$pw" -gt 12 ] && pw=12
+			rest=$((cols - 6 - spw - 1 - pw - 1 - pidw - 1))
+		fi
+		if [ $((rest - metw)) -ge 13 ]; then
+			memw=6 cpuw=5
+			rest=$((rest - metw))
+		fi
+		if [ "$rest" -ge 36 ]; then
+			pathw=$mpa
+			[ "$pathw" -gt $(((rest - 2) * 2 / 5)) ] && pathw=$(((rest - 2) * 2 / 5))
+			[ "$pathw" -lt 12 ] && pathw=12
+			cmdw=$((rest - 2 - pathw))
+			[ "$cmdw" -gt "$mpr" ] && cmdw=$mpr
+			[ "$cmdw" -lt 7 ] && cmdw=7
+			pathw=$((rest - 2 - cmdw))
+		elif [ "$rest" -ge 13 ]; then
+			pathw=$((rest - 1))
+		elif [ "$rest" -ge 0 ]; then
+			pw=$((pw + rest))
+			[ "$pw" -gt "$mpo" ] && pw=$mpo
+			[ "$pw" -lt 5 ] && pw=5
 		else
-			printf -v line '      %-12s %-20s %-7s %-30s %s' 'SPACE' 'PORTS' 'PID' 'PATH' 'COMMAND'
-			frame+=$'\033[38;5;244m'"$line"$'\033[0m\033[K\n'
-			for ((i = 1; i <= n; i++)); do
-				mark=' '
-				[ "$i" = "$cur" ] && mark='>'
-				chk=' '
-				# colored, but always exactly one visible char so printf's
-				# column widths stay honest
-				[ "${checked[i]}" = 1 ] && chk=$'\033[38;5;114m'x$'\033[39m'
-				printf -v line '%s [%s] %-12.12s %-20s %-7s %-30s %s' \
-					"$mark" "$chk" "${spaces[i]}" "${portss[i]}" "${pids[i]}" "${paths[i]}" "${cmds[i]:0:cmdw}"
-				if [ "$i" = "$cur" ]; then
-					frame+=$'\033[48;5;237m'"$line"$'\033[K\033[0m\n'
-				else
-					frame+="$line"$'\033[K\n'
+			pidw=0
+			avail=$((cols - 7))
+			pw=$((avail - spw - 1))
+			[ "$pw" -gt "$mpo" ] && pw=$mpo
+			if [ $((spw + 1 + pw)) -gt "$avail" ]; then
+				spw=$((avail - pw - 1))
+				if [ "$spw" -lt 4 ]; then
+					spw=4
+					pw=$((avail - 5))
 				fi
+			fi
+		fi
+
+		# rows beyond the pane scroll with the cursor instead of running over
+		# the footer
+		vis=$((rows - 5))
+		[ "$vis" -lt 1 ] && vis=1
+		[ "$cur" -le "$top" ] && top=$((cur - 1))
+		[ "$cur" -gt $((top + vis)) ] && top=$((cur - vis))
+		[ "$top" -lt 0 ] && top=0
+		last=$((top + vis))
+		[ "$last" -gt "$n" ] && last=$n
+
+		line='Listening in workspaces'
+		[ "$show_all" = 1 ] && line='All listeners'
+		scr[1]=$'\033[1m'"${line:0:cols-1}"$'\033[22m\033[38;5;'"$ACCENT"'m'
+		[ $((${#line} + ${#n} + 3)) -le "$cols" ] && scr[1]+="  $n"
+		if [ "$n" = 0 ]; then
+			scr[3]=$'\033[38;5;244m''  none - "a" lists every listener on the machine'
+		else
+			fit 'Space' "$spw" l
+			line="      $cell"
+			fit 'Program' "$cmdw" l ' '
+			line+=$cell
+			fit 'Ports' "$pw" l ' '
+			line+=$cell
+			fit 'Path' "$pathw" l ' '
+			line+=$cell
+			fit 'Pid' "$pidw" r ' '
+			line+=$cell
+			fit 'Mem' "$memw" r ' '
+			line+=$cell
+			fit 'Cpu%' "$cpuw" r ' '
+			line+=$cell
+			scr[3]=$'\033[1m'"$line"
+			for ((i = top + 1; i <= last; i++)); do
+				line=''
+				if [ "$i" = "$cur" ]; then
+					line=$'\033[48;5;237m\033[38;5;'"$ACCENT"$'m▌'
+				else
+					line=' '
+				fi
+				chk=' '
+				[ "${checked[i]}" = 1 ] && chk=${GREEN}x
+				line+=$'\033[38;5;240m ['"$chk"$'\033[38;5;240m] '
+				fit "${spaces[i]}" "$spw" l
+				if [ "${spaces[i]}" = - ]; then
+					line+=$'\033[38;5;240m'"$cell"
+				else
+					line+=$GREEN$cell
+				fi
+				fit "${cmds[i]}" "$cmdw" l ' '
+				line+=$'\033[38;5;250m'"$cell"
+				fit "${portss[i]}" "$pw" e ' '
+				line+=$'\033[38;5;'"$ACCENT"'m'"$cell"
+				fit "${paths[i]}" "$pathw" t ' '
+				line+=$'\033[38;5;244m'"$cell"
+				fit "${pids[i]}" "$pidw" r ' '
+				line+=$'\033[38;5;244m'"$cell"
+				fit "${mems[i]}" "$memw" r ' '
+				line+=$GREEN$cell
+				fit "${cpus[i]}" "$cpuw" r ' '
+				line+=$'\033[38;5;250m'"$cell"
+				scr[i - top + 3]=$line
 			done
 		fi
 
@@ -436,6 +597,7 @@ popup() {
 			fl+='r refresh'
 			btn_end[2]=${#fl}
 		fi
+		fl=${fl:0:cols-1}
 		c1=' ↵ kill '
 		c2=' esc close '
 		cw=$((${#c1} + 2 + ${#c2}))
@@ -447,11 +609,32 @@ popup() {
 		btn_line[4]=$rows
 		btn_start[4]=$((btn_end[1] + 3))
 		btn_end[4]=$((btn_start[4] + ${#c2} - 1))
-		frame+=$'\033[J\033['"$((rows - 1))"$';1H\033[38;5;244m'"$fl"$'\033[K\033[0m'
-		frame+=$'\033['"$rows"$';'"$cstart"$'H\033[48;5;'"$ACCENT"$'m\033[38;5;16m'"$c1"$'\033[0m  \033[48;5;238m\033[38;5;253m'"$c2"$'\033[0m\033[K'
-		printf '%s' "$frame"
+		scr[rows - 1]=$'\033[38;5;244m'"$fl"
+		scr[rows]="${PAD:0:cstart-1}"$'\033[48;5;'"$ACCENT"$'m\033[38;5;16m'"$c1"$'\033[0m  \033[48;5;238m\033[38;5;253m'"$c2"$'\033[0m'
+		# \033[K before the reset so the cursor row's background runs to the edge
+		for ((y = 1; y <= rows; y++)); do
+			[ "${scr[y]:-}" = "${old[y]:-}" ] && continue
+			frame+=$'\033['"$y"$';1H'"${scr[y]:-}"$'\033[K\033[0m'
+			old[y]=${scr[y]:-}
+		done
+		[ -n "$frame" ] && printf '%s' "$frame"
 
-		IFS= read -rsn1 key || exit 0
+		# A read timeout drives the auto-refresh. bash 3.2 reports a timeout
+		# like EOF (status 1), so EOF is told apart by returning at once.
+		t0=$SECONDS
+		if [ "$REFRESH" -gt 0 ]; then
+			IFS= read -rsn1 -t "$REFRESH" key
+		else
+			IFS= read -rsn1 key
+		fi
+		rc=$?
+		if [ "$rc" != 0 ]; then
+			# a WINCH may interrupt read: repaint at the new size
+			[ "$resized" = 1 ] && continue
+			[ "$REFRESH" -gt 0 ] && [ $((SECONDS - t0)) -ge 1 ] || exit 0
+			tick=1
+			continue
+		fi
 		case "$key" in
 			$'\e')
 				# bare Escape (empty tail) quits; otherwise process EVERY
@@ -483,8 +666,8 @@ popup() {
 							IFS=';' read -r mb mx my <<< "$ev"
 							case "$mb" in
 								0) # left click: row = toggle checkbox, footer segment = action
-									if [ "$my" -ge 4 ] && [ "$my" -le "$((n + 3))" ]; then
-										cur=$((my - 3))
+									if [ "$my" -ge 4 ] && [ "$my" -le "$((last - top + 3))" ]; then
+										cur=$((my - 3 + top))
 										checked[cur]=$((1 - checked[cur]))
 									else
 										for k in 1 2 3 4; do
