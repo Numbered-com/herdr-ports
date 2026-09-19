@@ -6,6 +6,8 @@ See which [herdr](https://herdr.dev) Space has a live server, and kill it: a
 `$ports` badge on every Space running a TCP listener, plus a popup to inspect
 and kill them.
 
+<img src="docs/sidebar.webp" width="300" alt="herdr sidebar with the ports badge">
+
 A listener belongs to a Space when its process cwd sits inside one of the
 Space's pane cwds, so servers started outside herdr still show up. There is no
 process-name filter. Panes sitting in `/` or `$HOME` are ignored, which keeps
@@ -65,8 +67,6 @@ Then `herdr server reload-config`.
 | `HERDR_PORTS_BADGE` | `↯` | badge glyph |
 
 ## How the badge works
-
-<img src="docs/sidebar.webp" width="300" alt="herdr sidebar with the ports badge">
 
 `herdr-ports watch` polls and posts a `ports` token as workspace metadata with
 a TTL, so the badge clears itself shortly after the last server dies. The
