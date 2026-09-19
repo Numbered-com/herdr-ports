@@ -1,14 +1,15 @@
 # herdr-ports
 
-Surface active dev servers in [herdr](https://herdr.dev): a generic `$ports`
-badge on every Space running at least one TCP listener, and a popup to inspect
-and kill them. Working on several projects at once, it answers "which space
-has a live server?" at a glance.
+![herdr-ports popup](docs/popup.png)
 
-Ports are attributed to a Space by matching the listener's process cwd against
-the cwds of the workspace's panes - servers started outside herdr still show
-up as long as they run inside a workspace directory. System daemons (cwd `/`,
-`~/Library`, ...) never match, so the default view stays clean.
+See which [herdr](https://herdr.dev) Space has a live server, and kill it: a
+`$ports` badge on every Space running a TCP listener, plus a popup to inspect
+and kill them.
+
+A listener belongs to a Space when its process cwd sits inside one of the
+Space's pane cwds, so servers started outside herdr still show up. There is no
+process-name filter. Panes sitting in `/` or `$HOME` are ignored, which keeps
+system daemons out.
 
 ## Install
 
@@ -41,45 +42,32 @@ Then `herdr server reload-config`.
 
 ## Popup
 
-```
-      Space  Program              Ports Path             Pid    Mem  Cpu%
-▌ [ ] webapp next-server (v16)    :3000 ~/dev/webapp   48213   305M   1.2
-  [x] api    bun run src/index.ts :8080 ~/dev/api      48377    64M   0.0
+- The table spans the pane: Space, Program, Ports, Path, then Pid, Mem and Cpu%
+  flush right. As the pane narrows, columns drop (Program, Mem and Cpu%, Path,
+  Pid), then Ports and Space crop. Long lists scroll with the cursor.
+- It refreshes every 3s, and only the screen lines that changed are repainted.
+- Keyboard: arrows or `j` `k` move, `space` checks, `enter` kills the checked
+  rows (or the highlighted one), `a` lists every listener on the machine, `r`
+  refreshes, `esc` or `q` quits.
+- Mouse: click a row to check it, wheel to move, footer hints and chips are
+  clickable.
+- Kill sends TERM, redraws as soon as the targets exit (stragglers get KILL in
+  the background) and clears the Space's badge right away.
 
-  ↑↓ move · space check · a all · r refresh
-                ↵ kill    esc close
-```
-
-The table spans the pane, btop-style: Space and Ports hug their content,
-Program and Path share the rest, Pid, Mem and Cpu% sit flush right. A row is any
-process holding a TCP `LISTEN` socket whose cwd sits in a workspace pane's cwd
-(no process-name filter); `a` lists every listener on the machine. As the pane
-narrows, columns drop in order (Program, Mem and Cpu%, Path, Pid), then Ports
-and Space crop; long lists scroll with the
-cursor. The table refreshes itself every `HERDR_PORTS_REFRESH` seconds (default
-3, `0` disables): one socket dump detects new or dead servers, one `ps` updates
-Mem and Cpu%, and only the screen lines that changed are repainted. Colors stay subtle: accent ports, green spaces, dim pid and command.
-
-The footer mimics herdr's native settings modal: a dim hint line (replaced by
-the outcome of the last kill), then CTA chips - accent `↵ kill`, gray
-`esc close`. Set `HERDR_PORTS_ACCENT` (256-color index, default 223) to match
-your theme's accent. Hints and chips are all clickable. Mouse: click a row to
-check it, use the wheel to move. Keyboard:
-
-- arrows / `j` `k`: move - `space`: check - `enter`: kill checked rows (or the
-  highlighted one when none checked); TERM, then the list redraws the instant
-  the targets exit (stragglers get KILL in the background), and the Space's
-  `$ports` badge clears right away instead of waiting out the metadata TTL
-- `a`: include listeners outside herdr workspaces - `r`: refresh - `esc` / `q`: quit
+| Variable | Default | |
+| --- | --- | --- |
+| `HERDR_PORTS_REFRESH` | `3` | popup refresh period in seconds, `0` disables |
+| `HERDR_PORTS_ACCENT` | `223` | 256-color index of the accent, match your theme |
+| `HERDR_PORTS_INTERVAL` | `5` | badge watcher poll period in seconds |
+| `HERDR_PORTS_BADGE` | `↯` | badge glyph |
 
 ## How the badge works
 
-`herdr-ports watch` polls every 5s (`HERDR_PORTS_INTERVAL`) and posts a
-`ports=↯` token (`HERDR_PORTS_BADGE`) as workspace metadata with a TTL,
-so the badge clears itself shortly after the last server dies. Nerd Font
-glyphs cannot be used here: herdr strips Private Use Area characters from
-metadata tokens. The watcher is a singleton started automatically by a
-`pane.created` event hook - no daemon setup needed.
+`herdr-ports watch` polls and posts a `ports` token as workspace metadata with
+a TTL, so the badge clears itself shortly after the last server dies. The
+watcher is a singleton started by a `pane.created` event hook, no daemon setup
+needed. Nerd Font glyphs cannot be used as badge: herdr strips Private Use Area
+characters from metadata tokens.
 
 ## CLI
 
