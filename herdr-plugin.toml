@@ -10,12 +10,15 @@ platforms = ["linux", "macos"]
 
 # Popup listing listening servers grouped by Space; arrows + space to check,
 # enter kills (TERM, then KILL after 2s), esc quits
+# Size in cells, not percent: fixed on large screens (140 fits every column),
+# and herdr clamps it to the terminal on small ones (mobile), where the table
+# sheds columns to fit
 [[panes]]
 id = "main"
 title = "ports"
 placement = "popup"
-width = "50%"
-height = "40%"
+width = 140
+height = 24
 command = ["./herdr-ports"]
 
 [[actions]]
