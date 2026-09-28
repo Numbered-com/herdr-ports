@@ -53,19 +53,24 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$(dirname "$0")/herdr-plugin.toml
 # One line per (pid, port) TCP listener: "pid<TAB>port".
 # Fastest one-shot kernel dump per platform (~5ms vs ~70ms for lsof, which
 # walks every fd of every process): macOS netstat reads the whole TCP pcblist
-# in a single sysctl and carries a process:pid column; Linux ss asks netlink
+# in a single sysctl and carries a pid column; Linux ss asks netlink
 # inet_diag. lsof remains the universal fallback.
 pid_ports() {
 	local out
 	if [ "$(uname 2> /dev/null)" = Darwin ] && command -v netstat > /dev/null 2>&1; then
 		# The process:pid token is located from the right: macOS addresses put
 		# a "." before the port, so a field ending in ":digits" can only be
-		# process:pid - immune to process names containing spaces or dots
+		# process:pid - immune to process names containing spaces or dots.
+		# macOS 15 has a bare pid column instead, located from the header:
+		# "Local Address"/"Foreign Address" are two header words but one data
+		# field each, hence the - 2
 		out=$(netstat -anv -p tcp 2> /dev/null | awk '
+			$1 == "Proto" { for (i = 1; i <= NF; i++) if ($i == "pid") pidcol = i - 2; next }
 			$6 == "LISTEN" {
 				port = $4; sub(/.*\./, "", port)
 				pid = ""
 				for (i = NF; i > 0; i--) if ($i ~ /:[0-9]+$/) { pid = $i; sub(/.*:/, "", pid); break }
+				if (pid == "" && pidcol > 0) pid = $pidcol
 				if (port ~ /^[0-9]+$/ && pid ~ /^[0-9]+$/) print pid "\t" port
 			}
 		' | sort -u)
