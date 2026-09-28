@@ -4,7 +4,8 @@
 #   herdr-ports               interactive popup: checkbox list of servers, kill them
 #   herdr-ports list          print the table once and exit (scripting/debug)
 #   herdr-ports watch         poller: tag Spaces running >=1 TCP listener with a
-#                             generic $ports badge (workspace metadata, TTL-cleared)
+#                             $ports badge and a $portlist of their ports
+#                             (workspace metadata, TTL-cleared)
 #   herdr-ports ensure-watch  start the watcher if it is not already running
 #                             (invoked by the pane.created plugin event)
 #
@@ -13,15 +14,18 @@
 # plugins cannot inject them (see README):
 #   [ui.sidebar.spaces]
 #   rows = [["state_icon", "workspace", "$ports"], ["branch", "git_status"]]
+# optionally with a ["$portlist"] row (":3000 :5173"), which herdr hides
+# while the Space has no listener.
 #
 #   [[keys.command]]
 #   key = "prefix+a"
 #   type = "plugin_action"
 #   command = "numbered.ports.open"
 #
-# Ports are attributed to a Space by matching the listener's process cwd
-# against the cwds of the workspace's panes, so servers started outside herdr
-# still show up as long as they run inside a workspace directory.
+# Ports are attributed to a Space by process ancestry (the listener descends
+# from a pane's shell), else by matching the listener's process cwd against
+# the cwds of the workspace's panes, so servers started outside herdr still
+# show up as long as they run inside a workspace directory.
 # Requires jq; lists sockets with netstat (macOS sysctl dump), ss (Linux
 # netlink) or lsof as universal fallback - lsof also resolves cwds on macOS.
 # Written for bash 3.2 (stock macOS): no mapfile, no associative arrays; and
@@ -163,11 +167,74 @@ match_join() {
 	' "$1" - | sort -u
 }
 
-# workspace_ids (one per line, sorted -u) running >=1 attributed TCP listener.
-# Shared by the watcher (post the badge) and the kill path (diff before/after
-# to clear the badge for Spaces that just lost their last server).
+# "shell_pid<TAB>workspace_id" for every pane. process-info costs one API call
+# per pane (~25ms, over a second with 50 panes), but a pane keeps its shell for
+# life: shells are cached per pane id and only new panes are queried. Pane ids
+# come fresh from pane list every time, so moved panes follow their Space.
+pane_shells() {
+	local cache pane ws sp
+	cache="/tmp/herdr-ports-shells.$(id -u).${HERDR_SESSION:-default}"
+	touch "$cache"
+	# shell_pid last: IFS tab is whitespace, so an empty middle field would
+	# collapse and shift the workspace id into it
+	"$HERDR" pane list 2> /dev/null | jq -r '.result.panes[]? | [.pane_id, .workspace_id] | @tsv' 2> /dev/null \
+		| awk -F'\t' -v OFS='\t' 'FILENAME == ARGV[1] { sh[$1] = $3; next } { print $1, $2, sh[$1] }' "$cache" - \
+		| while IFS=$'\t' read -r pane ws sp; do
+			[ -n "$sp" ] || sp=$("$HERDR" pane process-info --pane "$pane" 2> /dev/null \
+				| jq -r '.result.process_info.shell_pid // empty' 2> /dev/null)
+			[ -n "$sp" ] && printf '%s\t%s\t%s\n' "$pane" "$ws" "$sp"
+		done > "$cache.$$"
+	mv -f "$cache.$$" "$cache"
+	awk -F'\t' '{ print $3 "\t" $2 }' "$cache"
+}
+
+# $1: pane_shells file; stdin: "pid<TAB>..." -> "pid<TAB>ws_id" for listeners
+# whose parent chain reaches a pane shell. The depth cap guards ppid cycles.
+ancestry_join() {
+	awk '
+		FILENAME == ARGV[1] { ws[$1] = $2; next }
+		FILENAME == ARGV[2] { ppid[$1] = $2; next }
+		{
+			p = $1
+			for (i = 0; i < 64 && p > 1; i++) {
+				if (p in ws) { print $1 "\t" ws[p]; break }
+				p = ppid[p]
+			}
+		}
+	' "$1" <(ps -eo pid=,ppid= 2> /dev/null) -
+}
+
+# stdin: "pid<TAB>cwd" (pid_cwds) -> "pid<TAB>ws_id", sorted -u. Ancestry wins:
+# instances of one app started from the same directory in different Spaces
+# have identical cwds but different pane shells. Listeners with no pane
+# ancestor (daemons, docker, servers started outside herdr) fall back to cwd.
+pid_workspaces() {
+	local cwds anc
+	cwds=$(cat)
+	anc=$(printf '%s\n' "$cwds" | ancestry_join <(pane_shells) | sort -u)
+	{
+		printf '%s\n' "$anc"
+		printf '%s\n' "$cwds" | awk -F'\t' 'NR == FNR { claimed[$1]; next } $1 != "" && !($1 in claimed)' <(printf '%s\n' "$anc") - \
+			| match_join <(workspace_cwds) | cut -f1,3
+	} | awk NF | sort -u
+}
+
+# "ws_id<TAB>:p1 :p2" for every Space running >=1 attributed TCP listener,
+# sorted by Space, ports ascending and deduplicated (v4 + v6 binds). Shared by
+# the watcher (badge + port list) and the kill path (diff before/after to clear
+# the tokens of Spaces that just lost their last server).
+workspace_ports() {
+	local ports
+	ports=$(pid_ports)
+	[ -n "$ports" ] || return 0
+	awk -F'\t' 'NR == FNR { ws[$1] = ws[$1] " " $2; next } $1 in ws { n = split(ws[$1], w, " "); for (i = 1; i <= n; i++) print w[i] "\t" $2 }' \
+		<(printf '%s\n' "$ports" | pid_cwds | pid_workspaces) <(printf '%s\n' "$ports") \
+		| sort -t "$(printf '\t')" -u -k1,1 -k2,2n \
+		| awk -F'\t' '$1 != ws { if (ws != "") print ws "\t" list; ws = $1; list = ":" $2; next } { list = list " :" $2 } END { if (ws != "") print ws "\t" list }'
+}
+
 active_workspaces() {
-	pid_ports | pid_cwds | match_join <(workspace_cwds) | cut -f3 | sort -u
+	workspace_ports | cut -f1
 }
 
 pidfile_path() {
@@ -193,22 +260,25 @@ watch_loop() {
 	# seq is epoch-based: the server keeps the last seq per source across
 	# watcher restarts and silently drops posts that do not exceed it, so a
 	# counter restarting at 1 would never show again.
-	local ttl=$(((INTERVAL + 10) * 1000)) ws now cur prev="${HERDR_PORTS_PREV:-}"
+	local ttl=$(((INTERVAL + 10) * 1000)) ws list now rows cur prev="${HERDR_PORTS_PREV:-}"
 	local revision
 	revision=$(cksum < "$0")
 	while :; do
 		[ "$(cat "$(pidfile_path)" 2>/dev/null)" = "$$" ] || exit 0
-		cur=$(active_workspaces)
+		rows=$(workspace_ports)
+		cur=$(printf '%s\n' "$rows" | cut -f1)
 		now=$(date +%s)
-		for ws in $cur; do
-			"$HERDR" workspace report-metadata "$ws" --source ports \
-				--token ports="$BADGE" --ttl-ms "$ttl" --seq "$now" > /dev/null 2>&1
-		done
-		# comm needs sorted input; active_workspaces already sorts -u, and prev
-		# is a prior cur, so both sides are sorted
+		# $ports is the badge glyph, $portlist the ports themselves; one report
+		# so a Space never renders one updated without the other
+		while IFS=$'\t' read -r ws list; do
+			[ -n "$ws" ] && "$HERDR" workspace report-metadata "$ws" --source ports \
+				--token ports="$BADGE" --token portlist="$list" --ttl-ms "$ttl" --seq "$now" > /dev/null 2>&1 < /dev/null
+		done <<< "$rows"
+		# comm needs sorted input; workspace_ports sorts by Space, and prev is a
+		# prior cur, so both sides are sorted
 		for ws in $(comm -23 <(printf '%s\n' "$prev") <(printf '%s\n' "$cur")); do
 			[ -n "$ws" ] && "$HERDR" workspace report-metadata "$ws" \
-				--source ports --clear-token ports --seq "$now" > /dev/null 2>&1
+				--source ports --clear-token ports --clear-token portlist --seq "$now" > /dev/null 2>&1
 		done
 		prev=$cur
 		sleep "$INTERVAL"
@@ -249,19 +319,17 @@ AWK_MEM='function mem(k) { return k >= 1048576 ? sprintf("%.1fG", k / 1048576) :
 # "space<TAB>pid<TAB>:p1 :p2<TAB>cwd<TAB>mem<TAB>cpu<TAB>rss<TAB>cmd<TAB>worktree" sorted by space then first port;
 # space is "-" for listeners outside any herdr workspace (sorted last)
 build_rows() {
-	local tmp="$1" pids j1 j2
-	# the two herdr queries run alongside the socket dump; waited on by pid,
-	# a bare wait would also sit on kill_targets' detached SIGKILL child
-	workspace_cwds > "$tmp/ws" &
-	j1=$!
+	local tmp="$1" pids j
+	# the label query runs alongside the socket dump; waited on by pid, a bare
+	# wait would also sit on kill_targets' detached SIGKILL child
 	workspace_labels > "$tmp/labels" &
-	j2=$!
+	j=$!
 	pid_ports > "$tmp/ports"
 	# Resolve fresh cwds just like the watcher: processes can chdir without
 	# changing their PID or listening sockets, and failed lookups can recover.
 	pid_cwds < "$tmp/ports" > "$tmp/cwds"
-	wait "$j1" "$j2"
-	match_join "$tmp/ws" < "$tmp/cwds" | cut -f1,3 | sort -u > "$tmp/pidws"
+	pid_workspaces < "$tmp/cwds" > "$tmp/pidws"
+	wait "$j"
 	awk -F'\t' '
 		FILENAME == ARGV[1] { lbl[$1] = $2; tree[$1] = ($3 == "" ? "-" : $3); next }
 		FILENAME == ARGV[2] { if (!($1 in ws)) { ws[$1] = ($2 in lbl ? lbl[$2] : $2); wt[$1] = ($2 in tree ? tree[$2] : "-") }; next }
@@ -400,13 +468,13 @@ kill_targets() {
 		sleep 1
 		for pid in $remaining; do kill -9 "$pid" 2> /dev/null; done
 	) &
-	# clear the $ports badge for Spaces whose last listener just died; seq must
+	# clear the badge and port list for Spaces whose last listener just died; seq must
 	# exceed the watcher's last post (epoch seconds - our "now" wins unless the
 	# watcher posted this exact second, in which case the TTL is the backstop)
 	after=$(active_workspaces)
 	for ws in $(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after")); do
 		[ -n "$ws" ] && "$HERDR" workspace report-metadata "$ws" \
-			--source ports --clear-token ports --seq "$(date +%s)" > /dev/null 2>&1
+			--source ports --clear-token ports --clear-token portlist --seq "$(date +%s)" > /dev/null 2>&1
 	done
 	status="TERM →$killed"
 	[ -n "$remaining" ] && status="$status · KILL →$remaining"
