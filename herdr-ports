@@ -56,19 +56,23 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$(dirname "$0")/herdr-plugin.toml
 # in a single sysctl and carries a process:pid column; Linux ss asks netlink
 # inet_diag. lsof remains the universal fallback.
 pid_ports() {
+	local out
 	if [ "$(uname 2> /dev/null)" = Darwin ] && command -v netstat > /dev/null 2>&1; then
 		# The process:pid token is located from the right: macOS addresses put
 		# a "." before the port, so a field ending in ":digits" can only be
 		# process:pid - immune to process names containing spaces or dots
-		netstat -anv -p tcp 2> /dev/null | awk '
+		out=$(netstat -anv -p tcp 2> /dev/null | awk '
 			$6 == "LISTEN" {
 				port = $4; sub(/.*\./, "", port)
 				pid = ""
 				for (i = NF; i > 0; i--) if ($i ~ /:[0-9]+$/) { pid = $i; sub(/.*:/, "", pid); break }
 				if (port ~ /^[0-9]+$/ && pid ~ /^[0-9]+$/) print pid "\t" port
 			}
-		' | sort -u
-	elif [ -d /proc ] && command -v ss > /dev/null 2>&1; then
+		' | sort -u)
+		# macOS 27 netstat lists no TCP sockets at all (exit 0): empty -> lsof
+		[ -n "$out" ] && { printf '%s\n' "$out"; return; }
+	fi
+	if [ -d /proc ] && command -v ss > /dev/null 2>&1; then
 		ss -ltnpH 2> /dev/null | awk '
 			{
 				port = $4; sub(/.*:/, "", port)
