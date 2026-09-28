@@ -47,6 +47,8 @@ case "$REFRESH" in '' | *[!0-9]*) REFRESH=3 ;; esac
 # 4 gives one line per notch, 1 follows the terminal natively
 WHEEL="${HERDR_PORTS_WHEEL:-4}"
 case "$WHEEL" in '' | 0 | *[!0-9]*) WHEEL=4 ;; esac
+# Shown in the popup footer; herdr-plugin.toml is the single source of truth
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$(dirname "$0")/herdr-plugin.toml" 2> /dev/null)
 
 # One line per (pid, port) TCP listener: "pid<TAB>port".
 # Fastest one-shot kernel dump per platform (~5ms vs ~70ms for lsof, which
@@ -716,6 +718,8 @@ popup() {
 			fl+='r refresh'
 			btn_end[2]=$((${#fl} + fstart))
 		fi
+		# version trails the help line, so it is the first thing cropped
+		[ -n "$VERSION" ] && fl+="  v$VERSION"
 		c1=' ↵ kill '
 		c2=' esc close '
 		cw=$((${#c1} + 2 + ${#c2}))
