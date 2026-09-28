@@ -166,7 +166,7 @@ active_workspaces() {
 }
 
 pidfile_path() {
-	echo "/tmp/herdr-ports-watcher.$(id -u).pid"
+	echo "/tmp/herdr-ports-watcher.$(id -u).${HERDR_SESSION:-default}.pid"
 }
 
 watcher_alive() {

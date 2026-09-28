@@ -73,7 +73,7 @@ Then `herdr server reload-config`.
 
 `herdr-ports watch` polls and posts a `ports` token as workspace metadata with
 a TTL, so the badge clears itself shortly after the last server dies. The
-watcher is a singleton started by a `pane.created` event hook, no daemon setup
+watcher is a per-session singleton started by a `pane.created` event hook, no daemon setup
 needed. Nerd Font glyphs cannot be used as badge: herdr strips Private Use Area
 characters from metadata tokens.
 
