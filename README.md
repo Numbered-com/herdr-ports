@@ -3,8 +3,8 @@
 ![herdr-ports popup](docs/popup.webp)
 
 See which [herdr](https://herdr.dev) Space has a live server, and kill it: a
-`$ports` badge on every Space running a TCP listener, plus a popup to inspect
-and kill them.
+`$ports` badge on every Space running a TCP listener, an optional `$portlist`
+of its ports, plus a popup to inspect and kill them.
 
 <img src="docs/sidebar.webp" width="300" alt="herdr sidebar with the ports badge">
 
@@ -70,30 +70,29 @@ Then `herdr server reload-config`.
 - Mouse: click a row to check it, wheel to move, footer hints and chips are
   clickable.
 - Kill sends TERM, redraws as soon as the targets exit (stragglers get KILL in
-  the background) and clears the Space's badge right away.
+  the background) and clears the Space's badge and port list right away when
+  its last server is gone.
 
 | Variable | Default | |
 | --- | --- | --- |
 | `HERDR_PORTS_REFRESH` | `3` | popup refresh period in seconds, `0` disables |
 | `HERDR_PORTS_WHEEL` | `4` | wheel events per cursor step: `4` is one line per notch, `1` follows the terminal |
 | `HERDR_PORTS_ACCENT` | `223` | 256-color index of the accent, match your theme |
-| `HERDR_PORTS_INTERVAL` | `5` | badge watcher poll period in seconds |
+| `HERDR_PORTS_INTERVAL` | `5` | watcher poll period in seconds |
 | `HERDR_PORTS_BADGE` | `↯` | badge glyph |
 
 ## How the badge works
 
 `herdr-ports watch` polls and posts `ports` (the badge) and `portlist` tokens
 as workspace metadata with a TTL, so both clear themselves shortly after the
-last server dies. The
-watcher is a per-session singleton started by a `pane.created` event hook, no daemon setup
-needed. Nerd Font glyphs cannot be used as badge: herdr strips Private Use Area
-characters from metadata tokens.
+last server dies. The watcher is a per-session singleton started by a
+`pane.created` event hook, no daemon setup needed. Nerd Font glyphs cannot be
+used as badge: herdr strips Private Use Area characters from metadata tokens.
 
 The watcher reloads itself after script updates. The popup rechecks workspace
 and process directories on every refresh, even when the sockets are unchanged.
 Pane shell pids are cached per pane, so only newly opened panes cost an extra
-API call.
-All TCP listeners qualify, not only development servers.
+API call. All TCP listeners qualify, not only development servers.
 
 ## CLI
 
