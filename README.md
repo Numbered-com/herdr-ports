@@ -8,8 +8,11 @@ and kill them.
 
 <img src="docs/sidebar.webp" width="300" alt="herdr sidebar with the ports badge">
 
-A listener belongs to the Space with the most specific pane cwd containing
-its process cwd, so servers started outside herdr still show up. Repository-root
+A listener belongs to the Space whose pane launched it: its parent process
+chain reaches that pane's shell. This keeps several copies of one app started
+from the same directory in different Spaces apart. Listeners no pane launched
+(daemons, docker, servers started outside herdr) belong to the Space with the
+most specific pane cwd containing their process cwd. Repository-root
 listeners do not badge nested worktrees, and worktree listeners prefer their
 own Space over the parent repository. There is no process-name filter.
 Panes sitting in `/` or `$HOME` are ignored, which keeps system daemons out.
@@ -39,6 +42,14 @@ rows = [["state_icon", "workspace", "$ports"], ["branch", "git_status"]]
 key = "prefix+a"
 type = "plugin_action"
 command = "numbered.ports.open"
+```
+
+To also list the ports (`:3000 :5173`), add `$portlist` to a row. On the branch
+row it costs no extra line; herdr drops tokens without a value, so Spaces
+without a server look unchanged:
+
+```toml
+rows = [["state_icon", "workspace", "$ports"], ["branch", "git_status", "$portlist"]]
 ```
 
 Then `herdr server reload-config`.
@@ -71,14 +82,17 @@ Then `herdr server reload-config`.
 
 ## How the badge works
 
-`herdr-ports watch` polls and posts a `ports` token as workspace metadata with
-a TTL, so the badge clears itself shortly after the last server dies. The
+`herdr-ports watch` polls and posts `ports` (the badge) and `portlist` tokens
+as workspace metadata with a TTL, so both clear themselves shortly after the
+last server dies. The
 watcher is a per-session singleton started by a `pane.created` event hook, no daemon setup
 needed. Nerd Font glyphs cannot be used as badge: herdr strips Private Use Area
 characters from metadata tokens.
 
 The watcher reloads itself after script updates. The popup rechecks workspace
 and process directories on every refresh, even when the sockets are unchanged.
+Pane shell pids are cached per pane, so only newly opened panes cost an extra
+API call.
 All TCP listeners qualify, not only development servers.
 
 ## CLI
